@@ -15,7 +15,7 @@
  * Support: support@heltec.cn
  *
  * HelTec AutoMation, Chengdu, China
- * 成都惠利特自动化科技有限公司
+ * --------------
  * https://www.heltec.org
  * */
 
@@ -24,7 +24,7 @@
 //#include "LoRaMacCommands.h"
 #include "Wire.h"
 //#include "GXHTC.h"
-#include "img.h"
+ #include "img.h"
 #include "HT_DEPG0290BxS800FxX_BW.h"
 #include "sensor_solenoid.h"
 #include "esp_sleep.h"
@@ -42,7 +42,7 @@
 #include "esp_heap_caps.h"
 
 
-// 2) A handy macro to get a pointer to any struct at a given word‐index:
+// 2) A handy macro to get a pointer to any struct at a given word-index:
 // makes rtc vars volatile
 #define RTC_SLOW_BYTE_MEM ((uint8_t *)SOC_RTC_DATA_LOW)
 #define RTC_SLOW_MEMORY ((volatile uint32_t *)SOC_RTC_DATA_LOW)
@@ -60,13 +60,19 @@ DEPG0290BxS800FxX_BW display(5, 4, 3, 6, 2, 1, -1, 6000000);  // rst,dc,cs,busy,
 //GXHTC gxhtc;
 Preferences prefs;  // for NVM
 Adafruit_SHT4x sht4 = Adafruit_SHT4x();
+TwoWire* I2C = &Wire;
 
 static uint32_t g_last_tx_ms = 0;
+static bool     i2c_ok = true;
+static uint8_t  i2c_fail_streak = 0;
+static uint32_t i2c_quiet_until_ms = 0;
+static bool i2c_ready = 0;
+uint16_t pressResult = 0;//  used for adc result as global 
 
 // for display
 volatile bool g_need_display = false;
 
-// [GPT] helper: wait for E‑Ink BUSY to go idle without blocking the whole system
+// [GPT] helper: wait for E-Ink BUSY to go idle without blocking the whole system
 static bool eink_wait_idle(uint32_t timeout_ms) {
 
   const bool BUSY_ACTIVE = HIGH;  // DEPG0290 panels pull BUSY high while refreshing
@@ -85,16 +91,15 @@ ValveState_t vlv_packet_pend;  // used to keep the command and the state indepen
 
 
 //#define REED_NODE       true      //  count reed closures of one switch for water flow meter
-//#define VALVE_NODE      true      //  two valve controlller and possible line pressure
-#define SOIL_SENSOR_NODE true  //  two soil temp moist and possible pH
-//#define SOIL_AIR_SENSOR_NODE true   //  two soil temp moist, one air temp moist
+#define VALVE_NODE      true      //  two valve controlller and possible line pressure
+//#define SOIL_SENSOR_NODE true  //  two soil temp moist and possible pH
 //#define LAKE_NODE  true           //  one 16 bit number reflecting lake depth, calibration constants in device table
 
 
 /* OTAA para*/
-uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x06, 0x53, 0xf4 };
+uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x06, 0x53, 0xfa };
 uint8_t appEui[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-uint8_t appKey[] = { 0x74, 0xD6, 0x6E, 0x63, 0x45, 0x82, 0x48, 0x27, 0xFE, 0xC5, 0xB7, 0x70, 0xBA, 0x2B, 0x50, 0x4b };
+uint8_t appKey[] = { 0x74, 0xD6, 0x6E, 0x63, 0x45, 0x82, 0x48, 0x27, 0xFE, 0xC5, 0xB7, 0x70, 0xBA, 0x2B, 0x50, 0x51 };
 
 /* ABP para --  not used for this project*/
 uint8_t nwkSKey[] = { 0x15, 0xb1, 0xd0, 0xef, 0xa4, 0x63, 0xdf, 0xbe, 0x3d, 0x11, 0x18, 0x1e, 0x1e, 0xc7, 0xda, 0x85 };
@@ -112,10 +117,13 @@ DeviceClass_t loraWanClass = CLASS_A;
 
 /*the application data transmission duty cycle.  value in [ms].*/
 
-RTC_DATA_ATTR uint32_t appTxDutyCycle = 1 * 60 * 1000;
+RTC_DATA_ATTR uint32_t appTxDutyCycle = 60 * 60 * 1000;
 RTC_DATA_ATTR volatile uint32_t TxDutyCycle_hold;
 RTC_DATA_ATTR volatile uint32_t initialCycleFast;         //  number of time to cycle fast on startup
 RTC_DATA_ATTR volatile uint32_t g_sched_override_ms = 0;  //  pending cycle time changes to apply just before sleep
+RTC_DATA_ATTR uint16_t inv_m_u16 = 500;                      // b-10 stored as Q16.16 (converted once on downlink)
+RTC_DATA_ATTR uint16_t lakeRaw = 0;                       //  for display
+RTC_DATA_ATTR int16_t  b_x10     = 0;     // b in 0.1 m units (−200..200 covers −20..20 m)
 
 static const uint32_t TX_CYCLE_FAST_TIME = 30000ul;
 //These are in RTC defined in lorawanapp.cpp
@@ -138,14 +146,12 @@ bool isTxConfirmed = false;
 uint8_t appPort = 8;  //  REED_NODE port 8
 #elif defined VALVE_NODE
 uint8_t appPort = 9;  // VALVE_NODE port 9
-#elif defined SOIL_AIR_SENSOR_NODE
-uint8_t appPort = 6;  // SOIL_SENSOR_NODE port 6
 #elif defined SOIL_SENSOR_NODE
 uint8_t appPort = 11;  // SOIL_PH_SENSOR_NODE port 11
 #elif defined LAKE_NODE
 uint8_t appPort = 12;  // LAKE_NODE port 12
 #else
-#error "Define a node type in the list REED_NODE, VALVE_NODE, SOIL_SENSOR_NODE, SOIL_AIR_SENSOR_NODE, LAKE_NODE"
+#error "Define a node type in the list REED_NODE, VALVE_NODE, SOIL_SENSOR_NODE, LAKE_NODE"
 #endif
 
 /*!
@@ -179,7 +185,12 @@ static inline uint32_t read_count32() {
     hi1 = hi2;
   }
   return ((uint32_t)hi1 << 16) | lo;
+}
 
+// --- helper for calibrators---
+static inline float depth_m_from_raw(uint16_t raw) {
+  if (inv_m_u16 == 0) return 0.0f;                 // guard
+  return ((float)raw / (float)inv_m_u16) + ((float)b_x10 / 10.0f);
 }
 // Function to display the binary representation of an integer
 void displayBits16(uint16_t v) {
@@ -239,11 +250,16 @@ void pop_data(void) {
   (void)bat_cap8();
 
 #ifdef VALVE_NODE
-  //  line pressure, for valve node
-  uint16_t pressResult = readMCP3421avg_cont();
-  wPres[0] = (pressResult >> 8);    //  MSB
-  wPres[1] = (pressResult & 0xff);  //  LSB
+  if (i2c_ready) {
+    pressResult = readMCP3421avg_cont();
+    wPres[0] = (pressResult >> 8);
+    wPres[1] = (pressResult & 0xFF);
+  } else {
+    // optional fallback: zero 
+    wPres[0] = wPres[1] = 0;
+  }
 #endif
+
 
 #ifdef REED_NODE
 
@@ -283,8 +299,15 @@ void pop_data(void) {
 #endif
 
 #ifdef SOIL_SENSOR_NODE
-  readSoilSensor(1);
-  readSoilSensor(2);
+  uint8_t buf[64];
+if (readModbusFrame(0x01, 0x0001, 2, buf, sizeof(buf), 9600, 120)) {
+uint16_t reg0 = (buf[3] << 8) | buf[4]; // temp?
+uint16_t reg1 = (buf[5] << 8) | buf[6]; // moisture?
+}
+if (readModbusFrame(0x02, 0x0001, 2, buf, sizeof(buf), 9600, 120)) {
+uint16_t reg0 = (buf[3] << 8) | buf[4]; // temp?
+uint16_t reg1 = (buf[5] << 8) | buf[6]; // moisture?
+}
 #endif
 }
 
@@ -310,7 +333,7 @@ static void display_status() {
 
 
 #ifdef VALVE_NODE
-
+float pressure = depth_m_from_raw(pressResult);
   display.drawLine(0, 25, 120, 25);
   display.drawLine(150, 25, 270, 25);
   display.drawString(60, 0, "valve");
@@ -318,7 +341,8 @@ static void display_status() {
   display.drawString(60, 40, buffer);
   show_vlv_status(1);
   display.drawString(60, 65, buffer);
-  display.drawString(210, 0, "xxx psi");
+  snprintf(buffer, sizeof(buffer), "%u psi", pressure);
+  display.drawString(210, 0, buffer);
 #endif
 
 #ifdef REED_NODE
@@ -349,10 +373,26 @@ static void display_status() {
     display.drawString(60, 50, buffer);
   }
   if (soilSensorOut[2] || soilSensorOut[5]) {
-    snprintf(buffer, sizeof(buffer), "pH %u, %u", (uint8_t)soilSensorOut[2] / 10, (uint8_t)soilSensorOut[5] / 10);  //
+    snprintf(buffer, sizeof(buffer), "pH %.1f, %.1f", (float)soilSensorOut[2] / 10, (float)soilSensorOut[5] / 10);  //
     display.drawString(60, 70, buffer);
   }
 #endif
+
+#ifdef LAKE_NODE
+  // --- Lake depth display (calibrated meters), uplink remains uncalibrated ---
+  // Assume you already read the RS-485 16-bit raw value into, say, `lakeRaw`
+
+  float depth_m = depth_m_from_raw(pressResult);
+
+  display.setFont(ArialMT_Plain_24);
+  snprintf(buffer, sizeof(buffer), "Lake raw: %u", pressResult);
+  display.drawString(120, 30, buffer);
+
+  // show to 3 decimals (mm-ish): tweak as you like
+  snprintf(buffer, sizeof(buffer), "Depth: %.3f m", depth_m);
+  display.drawString(120, 0, buffer);
+#endif
+
 
   Serial.print("about to display.display \n");
   display.display();
@@ -361,9 +401,9 @@ static void display_status() {
   // Serial.printf(" [%2d]: 0x%08X\n", i, RTC_SLOW_MEMORY[i]);
   // }
 
-  // [GPT] wait for E‑Ink to finish via BUSY pin (non‑blocking yield with timeout)
+  // [GPT] wait for E-Ink to finish via BUSY pin (non-blocking yield with timeout)
   bool ok = eink_wait_idle(4000);
-  if (!ok) Serial.println("E‑ink wait timeout; proceeding cautiously");
+  if (!ok) Serial.println("E-ink wait timeout; proceeding cautiously");
 
 }  // of function
 
@@ -431,6 +471,12 @@ static void prepareTxFrame(uint8_t port) {
   appData[appDataSize++] = (uint8_t)(soilSensorOut[3]);                       //  moist deep
   appData[appDataSize++] = (uint8_t)(soilSensorOut[4]);                       //  temp C deep
   appData[appDataSize++] = (uint8_t)(soilSensorOut[5]);                       //  pH deep * 10
+  appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_BAT_PCT] & 0xff));  //  battery pct
+#endif
+
+#ifdef LAKE_NODE
+  appData[appDataSize++] = (uint8_t)(depthRaw >> 8);                          //  moist shallow
+  appData[appDataSize++] = (uint8_t)(depthRaw & 0xff);                        //  temp C shallow
   appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_BAT_PCT] & 0xff));  //  battery pct
 #endif
 
@@ -602,6 +648,26 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
                       (unsigned)w, (unsigned)th, (unsigned)v);
         break;
       }  // of CASE 8
+// Downlink handler (case 22):  1/m msb, lsb, b*10 msb, lsb  (four bytes)
+case 22: {
+  if (len != 4) { Serial.println("calib ignored (len!=4)"); break; }
+  uint16_t invm = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+  int16_t  bx10 = (int16_t)((uint16_t)buf[2] | ((uint16_t)buf[3] << 8));
+  if (invm == 0 || invm > 50000) { Serial.println("calib ignored (inv_m out of range)"); break; }
+
+  inv_m_u16 = invm;      // RTC (survives deep sleep)
+  b_x10     = bx10;
+
+  bool ok = false;
+  if (prefs.begin("lake_cal", false)) {
+    ok  = (prefs.putUShort("inv_m_u16", inv_m_u16) == sizeof(uint16_t));
+    ok &= (prefs.putShort ("b_x10",     b_x10    ) == sizeof(int16_t));
+    prefs.end();
+  }
+  Serial.printf("calib %s: inv_m=%u cnt/m  b=%.1f m\n", ok ? "stored" : "FAILED",
+                inv_m_u16, b_x10/10.0f);
+  break;
+}
 
   }  // of switch
   revrssi = mcpsIndication->Rssi;
@@ -769,21 +835,51 @@ static const ulp_insn_t ulp_program[] = {
   M_BX(ULP_ENTRY_LABEL),
 };
 
+static void rs485_spin() {
+for(;;) { RS485Send(0); delay(1000); }
+}
 
 void setup() {
+
   Serial.begin(115200);
+    delay(500);
+  // Debugging: Check the appPort value
+  Serial.print("App Port is set to: ");
+  Serial.println(appPort);  // This should print 11 for SOIL_SENSOR_NODE
+
+ 
   hardware_pins_init();  //
   setPowerEnable(1);
-  pinMode(EPD_BUSY_PIN, INPUT);
-
-
-#if defined(SOIL_SENSOR_NODE) || defined(LAKE_NODE)
-  initRS485(4800);
-#endif
 
   //Serial.printf("LORAWAN_APP_DATA_MAX_SIZE = %u\n", (unsigned)LORAWAN_APP_DATA_MAX_SIZE);
 
-  // Wire.begin(PIN_SDA, PIN_SCL);  // three lines set up the display
+// help weak/long pull-ups
+pinMode(PIN_SDA, INPUT_PULLUP);
+pinMode(PIN_SCL, INPUT_PULLUP);
+delay(50);  // rail settle
+
+// retry-probe window (~300 ms)
+uint32_t deadline = millis() + 300;
+bool found = false;
+do {
+  Wire.end();
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.beginTransmission(0x68);
+  if (Wire.endTransmission() == 0) { found = true; break; }
+
+  // simple bus recovery if SDA stuck low
+  pinMode(PIN_SCL, OUTPUT);
+  for (int i = 0; i < 9 && digitalRead(PIN_SDA) == LOW; ++i) {
+    digitalWrite(PIN_SCL, LOW); delayMicroseconds(5);
+    digitalWrite(PIN_SCL, HIGH); delayMicroseconds(5);
+  }
+  pinMode(PIN_SCL, INPUT_PULLUP);
+  delay(20);
+} while ((int32_t)(millis() - deadline) < 0);
+
+bool i2c_ready = found;
+Serial.printf("I2C 0x68 %s\n", i2c_ready ? "OK" : "NACK");
+// three lines set up the display
   // if (!sht4.begin()) {
   //   Serial.println("Couldn't find SHT40");
   //   } else{
@@ -817,7 +913,7 @@ void setup() {
   switch (cause) {
     case ESP_SLEEP_WAKEUP_ULP:
       {
-        // ── ULP woke us up ───────────────────────────────────────────────────────
+        // ── ULP woke us up 
         uint32_t count = read_count32();
 
         Serial.printf("Woke by ULP reed trigger, pulse count = %u\n", count);
@@ -826,7 +922,7 @@ void setup() {
 
     case ESP_SLEEP_WAKEUP_TIMER:
       {
-        // ── timer woke us up ───────────────────────────────────────────────────────
+        // ── timer woke us up
         uint32_t count = read_count32();
         Serial.printf("Woke by RTC TIMER, pulse count = %u\n", count);
       }
@@ -834,8 +930,8 @@ void setup() {
 
     case ESP_SLEEP_WAKEUP_UNDEFINED:  //  THIS IS COLD RESTART
       {
-        display.drawString(0, 40, "Connecting -> LoRaWAN");
-        display.display();
+        //display.drawString(0, 40, "Connecting -> LoRaWAN");
+        //display.display();
 #if !defined(VALVE_NODE)
         valveA->onA = 0;
         valveB->onB = 0;  // e.g., set to 0
@@ -863,9 +959,17 @@ void setup() {
         }  //  of if
            //  clear and then load and then kick off the ULP
 
+// Cold-boot restore (ESP_SLEEP_WAKEUP_UNDEFINED case)
+if (prefs.begin("lake_cal", true)) {
+  inv_m_u16 = prefs.getUShort("inv_m_u16", inv_m_u16);
+  b_x10     = prefs.getShort ("b_x10",     b_x10);
+  prefs.end();
+  Serial.printf("Calib restored: inv_m=%u cnt/m  b=%.1f m\n", inv_m_u16, b_x10/10.0f);
+}
+
         size_t size = sizeof(ulp_program) / sizeof(ulp_insn_t);
         esp_err_t result = ulp_process_macros_and_load(ULP_PROG_START, ulp_program, &size);
-        Serial.printf("load → %s, %u instructions\n",
+        Serial.printf("load - %s, %u instructions\n",
                       esp_err_to_name(result),
                       (unsigned)size);
         // 4) Kick off the ULP
@@ -879,12 +983,24 @@ void setup() {
         Serial.printf("Woke by DEFAULT, pulse count = %u\n", count);
       }
       break;
-  }  // cause
+  }  // case
 
   Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
-  Serial.printf("LORAWAN_APP_DATA_MAX_SIZE = %u\n", (unsigned)LORAWAN_APP_DATA_MAX_SIZE);
+  Serial.printf("wake up case completed, LORAWAN_APP_DATA_MAX_SIZE = %u\n", (unsigned)LORAWAN_APP_DATA_MAX_SIZE);
   g_need_display = true;
+  delay(100);
 
+#if defined(LAKE_NODE)
+  initRS485(4800);
+#endif
+#if defined(SOIL_SENSOR_NODE)
+  Serial.println("initRS485(9600)");
+  initRS485(9600);
+#endif
+
+    Serial.println("BOOT: after HELTEC_B start, Serial ready");
+// after Mcu.begin(...) and your Serial re-begin
+// rs485_uart_loopback_test(9600);   // one-shot self-test
 
 };  // of function
 
@@ -907,6 +1023,7 @@ void loop() {
       {
         prepareTxFrame(appPort);
         LoRaWAN.send();
+        deviceState = DEVICE_STATE_CYCLE; // ← advance state; don’t rely on the lib
         // [GPT] trigger a render after every uplink; actual drawing happens outside the switch
 
         if (g_need_display) {
@@ -915,8 +1032,9 @@ void loop() {
             g_last_tx_ms = 0;
             display_status();
           }
-          break;
+          g_need_display = true; // draw after RX windows
         }
+        break;
       }
         case DEVICE_STATE_CYCLE:
           {

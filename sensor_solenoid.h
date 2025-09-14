@@ -43,6 +43,9 @@
 
 #define CYCLE_TIME_VALVE_ON   600000    // 10 min in ms, cycle time with valve on
 
+// redirect all calls (works from .ino too)
+#define readModbusFrame(...) readModbusFrame_dbg(__FILE__, __LINE__, __VA_ARGS__)
+
 // typedef struct __attribute__((packed)) {
 
 //     unsigned vlv_A_on_remaining  : 8;  // 8 bits, max 1023, 10 min incriments
@@ -145,7 +148,6 @@ extern uint8_t aTxBuffer1[8];     // second soil moisture sensor message
 extern uint8_t sTempC[4];         // temperature data from soil probes
 extern uint8_t sMoist[4];         // moisture data from soil probes
 extern uint8_t wPres[2];         // raw pressure from adc, needs calibration and conversion
-extern uint8_t aRx[10];           // RS-485 returned data buffer
 extern uint8_t reedCount[2];  // reed pulses counted, MSB, LSB
 extern uint8_t reedcyclesTenMin[2]; // intra reed pulse converted to frequency in activations in 10 min, MSB, LSB
 extern uint8_t soilSensorOut[6];  //  for the two soil sensors including moisture, temp and pH
@@ -158,12 +160,21 @@ uint8_t bat_cap8();
 uint16_t readMCP3421avg_cont();
 
 void setPowerEnable(uint8_t powerState);
-void RS485Sub(uint8_t depth);
+void RS485Get();
+void RS485Send(uint8_t depth);
 void initRS485(uint16_t baud);
 bool readDepthSensor(uint16_t &depthRaw);
-void RS485Get();
 bool readFrame(uint8_t depth, uint8_t header, int& outIdx);
 void sendModbusRequest();
 uint16_t modbusCRC(const uint8_t* data, size_t length);
 bool buildModbusRequest(uint8_t slaveAddr, uint16_t regStart, uint16_t regCount, uint8_t (&request)[8]);
-bool readSoilSensor(uint8_t sensNumber);
+// (removed stale prototype for readSoilSensor; implementation is internal/static in .cpp)
+//bool readModbusFrame(uint8_t addr, uint16_t startReg, uint16_t regCount,
+//                            uint8_t* outBuf, size_t outMax, uint32_t baud, uint32_t frame_timeout_ms);
+static void dumpHex(const char* tag, const uint8_t* buf, size_t len);
+void rs485_uart_loopback_test(uint32_t baud);
+
+bool readModbusFrame_dbg(const char* file, int line,
+uint8_t addr, uint16_t startReg, uint16_t regCount,
+uint8_t* outBuf, size_t outMax,
+uint32_t baud=9600, uint32_t frame_timeout_ms=80);
