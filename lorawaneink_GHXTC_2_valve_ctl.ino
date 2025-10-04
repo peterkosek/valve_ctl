@@ -24,7 +24,6 @@
 //#include "LoRaMacCommands.h"
 #include "Wire.h"
 //#include "GXHTC.h"
- #include "img.h"
 #include "HT_DEPG0290BxS800FxX_BW.h"
 #include "sensor_solenoid.h"
 #include "esp_sleep.h"
@@ -40,6 +39,8 @@
 #include <Arduino.h>
 #include "Adafruit_SHT4x.h"
 #include "esp_heap_caps.h"
+#include "valve_logic.h"
+#include <string.h>
 
 
 // 2) A handy macro to get a pointer to any struct at a given word-index:
@@ -53,6 +54,9 @@
 
 volatile ValveState_t *valveA = RTC_SLOW_STRUCT_PTR(ValveState_t, ULP_VALVE_A);
 volatile ValveState_t *valveB = RTC_SLOW_STRUCT_PTR(ValveState_t, ULP_VALVE_B);
+RTC_DATA_ATTR volatile uint32_t g_status_uplink_at = 0;
+static const uint32_t STATUS_UPLINK_DELAY_MS = 3000;  // ~3 s after RX2
+
 RTC_DATA_ATTR char g_name[13] = "no name";  // screen display name
 RTC_DATA_ATTR uint32_t epd_hygiene = 0;     //    to reset the screen ever 50 wakes
 
@@ -60,25 +64,27 @@ DEPG0290BxS800FxX_BW display(5, 4, 3, 6, 2, 1, -1, 6000000);  // rst,dc,cs,busy,
 //GXHTC gxhtc;
 Preferences prefs;  // for NVM
 Adafruit_SHT4x sht4 = Adafruit_SHT4x();
-TwoWire* I2C = &Wire;
+TwoWire *I2C = &Wire;
 
 static uint32_t g_last_tx_ms = 0;
-static bool     i2c_ok = true;
-static uint8_t  i2c_fail_streak = 0;
+static bool i2c_ok = true;
+static uint8_t i2c_fail_streak = 0;
 static uint32_t i2c_quiet_until_ms = 0;
 static bool i2c_ready = 0;
-uint16_t pressResult = 0;//  used for adc result as global 
-
+static bool join_inflight = false;
+static uint32_t join_retry_at_ms = 0;
+RTC_DATA_ATTR uint16_t pressResult = 0;  //  used for adc result as global, lake and line pressure
+static bool g_skip_next_decrement = false;
 // for display
 volatile bool g_need_display = false;
 
 // [GPT] helper: wait for E-Ink BUSY to go idle without blocking the whole system
-static bool eink_wait_idle(uint32_t timeout_ms) {
+bool eink_wait_idle(uint32_t timeout_ms) {
 
   const bool BUSY_ACTIVE = HIGH;  // DEPG0290 panels pull BUSY high while refreshing
   uint32_t deadline = millis() + timeout_ms;
   while (digitalRead(EPD_BUSY_PIN) == BUSY_ACTIVE) {
-    vTaskDelay(pdMS_TO_TICKS(10));                          // yield to other tasks (LoRa, etc.)
+    delay(500);  // yield to other tasks (LoRa, etc.)
 
     if ((int32_t)(millis() - deadline) >= 0) return false;  // timed out
   }
@@ -87,19 +93,19 @@ static bool eink_wait_idle(uint32_t timeout_ms) {
 
 
 char buffer[64];
-ValveState_t vlv_packet_pend;  // used to keep the command and the state independent until resolved
+volatile ValveState_t vlv_packet_pend;  // used to keep the command and the state independent until resolved
 
 
 //#define REED_NODE       true      //  count reed closures of one switch for water flow meter
-#define VALVE_NODE      true      //  two valve controlller and possible line pressure
+#define VALVE_NODE true  //  two valve controlller and possible line pressure
 //#define SOIL_SENSOR_NODE true  //  two soil temp moist and possible pH
 //#define LAKE_NODE  true           //  one 16 bit number reflecting lake depth, calibration constants in device table
 
 
 /* OTAA para*/
-uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x06, 0x53, 0xfa };
+uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x06, 0x53, 0xf6 };
 uint8_t appEui[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-uint8_t appKey[] = { 0x74, 0xD6, 0x6E, 0x63, 0x45, 0x82, 0x48, 0x27, 0xFE, 0xC5, 0xB7, 0x70, 0xBA, 0x2B, 0x50, 0x51 };
+uint8_t appKey[] = { 0x74, 0xD6, 0x6E, 0x63, 0x45, 0x82, 0x48, 0x27, 0xFE, 0xC5, 0xB7, 0x70, 0xBA, 0x2B, 0x50, 0x4D };
 
 /* ABP para --  not used for this project*/
 uint8_t nwkSKey[] = { 0x15, 0xb1, 0xd0, 0xef, 0xa4, 0x63, 0xdf, 0xbe, 0x3d, 0x11, 0x18, 0x1e, 0x1e, 0xc7, 0xda, 0x85 };
@@ -117,15 +123,15 @@ DeviceClass_t loraWanClass = CLASS_A;
 
 /*the application data transmission duty cycle.  value in [ms].*/
 
-RTC_DATA_ATTR uint32_t appTxDutyCycle = 60 * 60 * 1000;
+RTC_DATA_ATTR uint32_t appTxDutyCycle = 1 * 60 * 1000;
 RTC_DATA_ATTR volatile uint32_t TxDutyCycle_hold;
 RTC_DATA_ATTR volatile uint32_t initialCycleFast;         //  number of time to cycle fast on startup
 RTC_DATA_ATTR volatile uint32_t g_sched_override_ms = 0;  //  pending cycle time changes to apply just before sleep
-RTC_DATA_ATTR uint16_t inv_m_u16 = 500;                      // b-10 stored as Q16.16 (converted once on downlink)
+RTC_DATA_ATTR uint16_t inv_m_u16 = 500;                   // b-10 stored as Q16.16 (converted once on downlink)
 RTC_DATA_ATTR uint16_t lakeRaw = 0;                       //  for display
-RTC_DATA_ATTR int16_t  b_x10     = 0;     // b in 0.1 m units (−200..200 covers −20..20 m)
+RTC_DATA_ATTR int16_t b_x10 = 0;                          // b in 0.1 m units (−200..200 covers −20..20 m)
 
-static const uint32_t TX_CYCLE_FAST_TIME = 30000ul;
+static const uint32_t TX_CYCLE_FAST_TIME = 60000ul;
 //These are in RTC defined in lorawanapp.cpp
 extern int revrssi;
 extern int revsnr;
@@ -176,7 +182,7 @@ uint8_t appPort = 12;  // LAKE_NODE port 12
  */
 uint8_t confirmedNbTrials = 4;
 
-static inline uint32_t read_count32() {
+inline uint32_t read_count32() {
   uint16_t hi1 = (uint16_t)RTC_SLOW_MEMORY[ULP_COUNT_HI];
   uint16_t lo = (uint16_t)RTC_SLOW_MEMORY[ULP_COUNT_LO];
   uint16_t hi2 = (uint16_t)RTC_SLOW_MEMORY[ULP_COUNT_HI];
@@ -188,51 +194,144 @@ static inline uint32_t read_count32() {
 }
 
 // --- helper for calibrators---
-static inline float depth_m_from_raw(uint16_t raw) {
-  if (inv_m_u16 == 0) return 0.0f;                 // guard
+inline float depth_m_from_raw(uint16_t raw) {
+  if (inv_m_u16 == 0) return 0.0f;  // guard
   return ((float)raw / (float)inv_m_u16) + ((float)b_x10 / 10.0f);
-}
-// Function to display the binary representation of an integer
-void displayBits16(uint16_t v) {
-  for (int i = 15; i >= 0; --i) {
-    Serial.print((v >> i) & 1);
-  }
-  Serial.printf("\nvalve A time %d status %d off %d\n", (int)valveA->time, (int)valveA->onA, (int)valveA->offA);
-  Serial.printf("valve B time %d status %d off %d\n", (int)valveB->time, (int)valveB->onB, (int)valveB->offB);
-  Serial.printf("pending time %d status %d:%d off %d:%d\n", (int)vlv_packet_pend.time, (int)vlv_packet_pend.onA, (int)vlv_packet_pend.onB, (int)vlv_packet_pend.offA, (int)vlv_packet_pend.offB);
-  //Serial.printf("vbat read %d \n", bat_cap8());
-}
-
-void displayPacketBits(const ValveState_t &p) {
-  uint16_t v = 0;
-  memcpy(&v, &p, sizeof(v));  // pull the raw bytes straight into a uint16_t
-  displayBits16(v);
 }
 
 //  display status draws the screen before sleep, after a delay from uploading to receive any download
-static void show_vlv_status(uint8_t vlv) {
+void show_vlv_status(uint8_t vlv) {
   switch (vlv) {
     case 0:
       if (valveA->onA) {
-        snprintf(buffer, sizeof(buffer), "%u min\n", (unsigned)(valveA->time * 10));
+        unsigned mins = (unsigned)((valveA->time * 10));  //   as the time has already been decremented
+        snprintf(buffer, sizeof(buffer), "A %u min\n", mins);
+      } else if (valveA->latchA) {
+        snprintf(buffer, sizeof(buffer), "A latched\n");
       } else {
-
         snprintf(buffer, sizeof(buffer), "A off");
-
       }
+
       break;
     case 1:
       if (valveB->onB) {
-        snprintf(buffer, sizeof(buffer), "%u min\n", (unsigned)(valveB->time * 10));
+        unsigned mins = (unsigned)((valveB->time * 10));
+        snprintf(buffer, sizeof(buffer), "B %u min\n", mins);
+      } else if (valveB->latchB) {
+        snprintf(buffer, sizeof(buffer), "B latched\n");
       } else {
-
         snprintf(buffer, sizeof(buffer), "B off");
-
       }
       break;
   }
 }
 
+// replace your scheduler with this
+static inline void schedule_next_cycle(void) {
+  if (initialCycleFast > 0) {
+    LoRaWAN.cycle(TX_CYCLE_FAST_TIME);
+    initialCycleFast--;
+  } else {
+    LoRaWAN.cycle(appTxDutyCycle);  // whatever the valve logic set
+  }
+}
+
+void display_status() {
+  Serial.println("in display_status fx ");
+  // [GPT] init-once in setup; removed display.init() here to avoid heap churn
+
+  display.clear();  // wipe framebuffer before drawing
+  display.setFont(ArialMT_Plain_16);
+  display.setTextAlignment(TEXT_ALIGN_CENTER);
+  //common screen entries:  battery, cycle time, rssi, snr, display name
+  snprintf(buffer, sizeof(buffer), "battery: %lu %%", RTC_SLOW_MEMORY[ULP_BAT_PCT]);  // bat_cap8() populates this, and is run in prepareDataFrame
+  display.drawString(210, 50, buffer);
+  snprintf(buffer, sizeof(buffer), "cycle %lu min", (uint32_t)appTxDutyCycle / 60000);  //  SHOULD BE 60000 milliseconds to mins
+  display.drawString(210, 70, buffer);
+  snprintf(buffer, sizeof(buffer), "rssi (dBm): %d snr: %d", revrssi, revsnr);
+  display.drawString(210, 90, buffer);
+  snprintf(buffer, sizeof(buffer), "Eui: ...%02x%02x", devEui[6], devEui[7]);  //  last two bytes of devEui
+
+  display.drawString(210, 110, buffer);
+  display.setFont(ArialMT_Plain_24);
+  display.drawString(60, 100, g_name);  //  screen name
+
+
+#ifdef VALVE_NODE
+  float pressure = depth_m_from_raw(pressResult);
+  display.drawLine(0, 25, 120, 25);
+  display.drawLine(150, 25, 270, 25);
+  display.drawString(60, 0, "valve");
+  show_vlv_status(0);
+  display.drawString(60, 40, buffer);
+  show_vlv_status(1);
+  display.drawString(60, 65, buffer);
+  snprintf(buffer, sizeof(buffer), "%.1f psi", pressure);
+  display.drawString(210, 0, buffer);
+#endif
+
+#ifdef REED_NODE
+  display.drawLine(0, 25, 80, 25);
+  display.drawLine(95, 25, 300, 25);
+  display.drawString(80, 0, "interval  total c");
+  snprintf(buffer, sizeof(buffer), "%u gal/m", (uint32_t)(RTC_SLOW_MEMORY[ULP_FLOW_RATE]));
+  display.drawString(60, 35, buffer);
+  snprintf(buffer, sizeof(buffer), "%u gal", (uint32_t)(RTC_SLOW_MEMORY[ULP_VOLUME_DELTA]));
+  display.drawString(60, 65, buffer);
+  uint32_t count = read_count32();
+  snprintf(buffer, sizeof(buffer), "%lu", count);  // counter
+  display.drawString(220, 0, buffer);
+  display.setFont(ArialMT_Plain_16);
+  snprintf(buffer, sizeof(buffer), "reed/wake: %lu", RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD]);  // reed closures per wake cycle
+  display.drawString(210, 30, buffer);
+#endif
+
+#ifdef SOIL_SENSOR_NODE
+  display.setFont(ArialMT_Plain_16);
+  display.drawString(60, 0, "Soil s, d");
+  if (soilSensorOut[0] || soilSensorOut[3]) {
+    snprintf(buffer, sizeof(buffer), "H20%% %u,  %u", soilSensorOut[0], soilSensorOut[3]);
+    display.drawString(60, 30, buffer);
+  }
+  if (soilSensorOut[1] || soilSensorOut[4]) {
+    snprintf(buffer, sizeof(buffer), "degC %u, %u", soilSensorOut[1], soilSensorOut[4]);
+    display.drawString(60, 50, buffer);
+  }
+  if (soilSensorOut[2] || soilSensorOut[5]) {
+    snprintf(buffer, sizeof(buffer), "pH %.1f, %.1f", (float)soilSensorOut[2] / 10, (float)soilSensorOut[5] / 10);  //
+    display.drawString(60, 70, buffer);
+  }
+#endif
+
+#ifdef LAKE_NODE
+  // --- Lake depth display (calibrated meters), uplink remains uncalibrated ---
+  // Assume you already read the RS-485 16-bit raw value into, say, `lakeRaw`
+
+  float depth_m = depth_m_from_raw(pressResult);
+
+  display.setFont(ArialMT_Plain_24);
+  snprintf(buffer, sizeof(buffer), "Depth: %.3f", depth_m);
+  display.drawString(120, 30, buffer);
+
+  // show to 3 decimals (mm-ish): tweak as you like
+  snprintf(buffer, sizeof(buffer), "Depth: %.3f m", depth_m);
+  display.drawString(120, 0, buffer);
+#endif
+
+
+  Serial.print("about to display.display \n");
+  display.display();
+
+  // for(int i = 0; i < 25; i++){
+  // Serial.printf(" [%2d]: 0x%08X\n", i, RTC_SLOW_MEMORY[i]);
+  // }
+
+  // [GPT] wait for E-Ink to finish via BUSY pin (non-blocking yield with timeout)
+  bool ok = eink_wait_idle(4000);
+  if (!ok) Serial.println("E-ink wait timeout; proceeding cautiously");
+  delay(2000);  //  more time to be sure...
+
+}  // of function
 /*
 POPULATE THE DATA FIELDS OF PRESSURE, COUNT DELTA AND TIMER DELTA FOR THE LAST REED COUNT
 
@@ -255,7 +354,7 @@ void pop_data(void) {
     wPres[0] = (pressResult >> 8);
     wPres[1] = (pressResult & 0xFF);
   } else {
-    // optional fallback: zero 
+    // optional fallback: zero
     wPres[0] = wPres[1] = 0;
   }
 #endif
@@ -300,112 +399,26 @@ void pop_data(void) {
 
 #ifdef SOIL_SENSOR_NODE
   uint8_t buf[64];
-if (readModbusFrame(0x01, 0x0001, 2, buf, sizeof(buf), 9600, 120)) {
-uint16_t reg0 = (buf[3] << 8) | buf[4]; // temp?
-uint16_t reg1 = (buf[5] << 8) | buf[6]; // moisture?
-}
-if (readModbusFrame(0x02, 0x0001, 2, buf, sizeof(buf), 9600, 120)) {
-uint16_t reg0 = (buf[3] << 8) | buf[4]; // temp?
-uint16_t reg1 = (buf[5] << 8) | buf[6]; // moisture?
-}
-#endif
-}
-
-static void display_status() {
-  Serial.println("in display_status fx ");
-  // [GPT] init-once in setup; removed display.init() here to avoid heap churn
-
-  display.clear();  // wipe framebuffer before drawing
-  display.setFont(ArialMT_Plain_16);
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
-  //common screen entries:  battery, cycle time, rssi, snr, display name
-  snprintf(buffer, sizeof(buffer), "battery: %lu %%", RTC_SLOW_MEMORY[ULP_BAT_PCT]);  // bat_cap8() populates this, and is run in prepareDataFrame
-  display.drawString(210, 50, buffer);
-  snprintf(buffer, sizeof(buffer), "cycle %lu min", (uint32_t)appTxDutyCycle / 60000);  //  SHOULD BE 60000 milliseconds to mins
-  display.drawString(210, 70, buffer);
-  snprintf(buffer, sizeof(buffer), "rssi (dBm): %d snr: %d", revrssi, revsnr);
-  display.drawString(210, 90, buffer);
-  snprintf(buffer, sizeof(buffer), "Eui: ...%02x%02x", devEui[6], devEui[7]);  //  last two bytes of devEui
-
-  display.drawString(210, 110, buffer);
-  display.setFont(ArialMT_Plain_24);
-  display.drawString(60, 100, g_name);  //  screen name
-
-
-#ifdef VALVE_NODE
-float pressure = depth_m_from_raw(pressResult);
-  display.drawLine(0, 25, 120, 25);
-  display.drawLine(150, 25, 270, 25);
-  display.drawString(60, 0, "valve");
-  show_vlv_status(0);
-  display.drawString(60, 40, buffer);
-  show_vlv_status(1);
-  display.drawString(60, 65, buffer);
-  snprintf(buffer, sizeof(buffer), "%u psi", pressure);
-  display.drawString(210, 0, buffer);
-#endif
-
-#ifdef REED_NODE
-  display.drawLine(0, 25, 80, 25);
-  display.drawLine(95, 25, 300, 25);
-  display.drawString(80, 0, "interval  total c");
-  snprintf(buffer, sizeof(buffer), "%u gal/m", (uint32_t)(RTC_SLOW_MEMORY[ULP_FLOW_RATE]));
-  display.drawString(60, 35, buffer);
-  snprintf(buffer, sizeof(buffer), "%u gal", (uint32_t)(RTC_SLOW_MEMORY[ULP_VOLUME_DELTA]));
-  display.drawString(60, 65, buffer);
-  uint32_t count = read_count32();
-  snprintf(buffer, sizeof(buffer), "%lu", count);  // counter
-  display.drawString(220, 0, buffer);
-  display.setFont(ArialMT_Plain_16);
-  snprintf(buffer, sizeof(buffer), "reed/wake: %lu", RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD]);  // reed closures per wake cycle
-  display.drawString(210, 30, buffer);
-#endif
-
-#ifdef SOIL_SENSOR_NODE
-  display.setFont(ArialMT_Plain_16);
-  display.drawString(60, 0, "Soil s, d");
-  if (soilSensorOut[0] || soilSensorOut[3]) {
-    snprintf(buffer, sizeof(buffer), "H20%% %u,  %u", soilSensorOut[0], soilSensorOut[3]);
-    display.drawString(60, 30, buffer);
+  if (readModbusFrame(0x01, 0x0001, 2, buf, sizeof(buf), 9600, 120)) {
+    uint16_t reg0 = (buf[3] << 8) | buf[4];  // temp?
+    uint16_t reg1 = (buf[5] << 8) | buf[6];  // moisture?
   }
-  if (soilSensorOut[1] || soilSensorOut[4]) {
-    snprintf(buffer, sizeof(buffer), "degC %u, %u", soilSensorOut[1], soilSensorOut[4]);
-    display.drawString(60, 50, buffer);
-  }
-  if (soilSensorOut[2] || soilSensorOut[5]) {
-    snprintf(buffer, sizeof(buffer), "pH %.1f, %.1f", (float)soilSensorOut[2] / 10, (float)soilSensorOut[5] / 10);  //
-    display.drawString(60, 70, buffer);
+  if (readModbusFrame(0x02, 0x0001, 2, buf, sizeof(buf), 9600, 120)) {
+    uint16_t reg0 = (buf[3] << 8) | buf[4];  // temp?
+    uint16_t reg1 = (buf[5] << 8) | buf[6];  // moisture?
   }
 #endif
 
 #ifdef LAKE_NODE
-  // --- Lake depth display (calibrated meters), uplink remains uncalibrated ---
-  // Assume you already read the RS-485 16-bit raw value into, say, `lakeRaw`
+  delay(100);  //  allow sensor to stabilize
+  pressResult = readDepthSensor(200, 7);
+  wPres[0] = (pressResult >> 8);
+  wPres[1] = (pressResult & 0xFF);
 
-  float depth_m = depth_m_from_raw(pressResult);
-
-  display.setFont(ArialMT_Plain_24);
-  snprintf(buffer, sizeof(buffer), "Lake raw: %u", pressResult);
-  display.drawString(120, 30, buffer);
-
-  // show to 3 decimals (mm-ish): tweak as you like
-  snprintf(buffer, sizeof(buffer), "Depth: %.3f m", depth_m);
-  display.drawString(120, 0, buffer);
 #endif
+  //g_need_display = true;
+}
 
-
-  Serial.print("about to display.display \n");
-  display.display();
-
-  // for(int i = 0; i < 25; i++){
-  // Serial.printf(" [%2d]: 0x%08X\n", i, RTC_SLOW_MEMORY[i]);
-  // }
-
-  // [GPT] wait for E-Ink to finish via BUSY pin (non-blocking yield with timeout)
-  bool ok = eink_wait_idle(4000);
-  if (!ok) Serial.println("E-ink wait timeout; proceeding cautiously");
-
-}  // of function
 
 /* Prepares the payload of the frame and decrements valve counter or turns off if time is up*/
 static void prepareTxFrame(uint8_t port) {
@@ -416,24 +429,39 @@ static void prepareTxFrame(uint8_t port) {
    *appDataSize max value is LORAWAN_APP_DATA_MAX_SIZE.
    *data is pressure (msb, lsb) in raw adc conversion needs to be calibrated and converted to psi
    */
-  if (valveA->onA) {
-    if (valveA->time) {
-      valveA->time--;
-    } else {
+
+  bool skip = g_skip_next_decrement;
+
+
+  // ----- Valve A -----
+  if (valveA->onA && !valveA->latchA) {
+    if (!skip && valveA->time > 0) {
+      valveA->time--;  // decrement this tick
+    }
+    if (valveA->time == 0) {  // if it just hit zero, turn off now
       controlValve(0, 0);
       valveA->onA = 0;
+      valveA->latchA = 0;
       if (valveB->offB || !valveB->onB) appTxDutyCycle = TxDutyCycle_hold;
     }
+    g_need_display = true;
   }
-  if (valveB->onB) {
-    if (valveB->time) {
-      valveB->time--;
-    } else {
+
+  // ----- Valve B -----
+  if (valveB->onB && !valveB->latchB) {
+    if (!skip && valveB->time > 0) {
+      valveB->time--;  // decrement this tick
+    }
+    if (valveB->time == 0) {  // if it just hit zero, turn off now
       controlValve(1, 0);
       valveB->onB = 0;
+      valveB->latchB = 0;
       if (valveA->offA || !valveA->onA) appTxDutyCycle = TxDutyCycle_hold;
     }
+    g_need_display = true;
   }
+
+
   // [GPT] replace hard 2 s delay with cooperative short wait (~200 ms)
 
   uint32_t t_end = millis() + 200;
@@ -457,10 +485,16 @@ static void prepareTxFrame(uint8_t port) {
 #endif
 
 #ifdef VALVE_NODE
-  appData[appDataSize++] = wPres[0];                                          //  msb
-  appData[appDataSize++] = wPres[1];                                          //  lsb
-  appData[appDataSize++] = (uint8_t)(valveA->time);                           //  valve A
-  appData[appDataSize++] = (uint8_t)(valveB->time);                           //  valve B
+  appData[appDataSize++] = wPres[0];                 //  msb, raw
+  appData[appDataSize++] = wPres[1];                 //  lsb
+  appData[appDataSize++] = (uint8_t)(valveA->time);  //  valve A
+  appData[appDataSize++] = (uint8_t)(valveB->time);  //  valve B
+  uint8_t flags =
+    ((valveA->onA ? 1 : 0)) |                                                 // bit0
+    ((valveB->onB ? 1 : 0) << 1) |                                            // bit1
+    ((valveA->latchA ? 1 : 0) << 2) |                                         // bit2
+    ((valveB->latchB ? 1 : 0) << 3);                                          // bit3
+  appData[appDataSize++] = flags;                                             // NEW: latch/ON bits
   appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_BAT_PCT] & 0xff));  //
 #endif
 
@@ -475,8 +509,8 @@ static void prepareTxFrame(uint8_t port) {
 #endif
 
 #ifdef LAKE_NODE
-  appData[appDataSize++] = (uint8_t)(depthRaw >> 8);                          //  moist shallow
-  appData[appDataSize++] = (uint8_t)(depthRaw & 0xff);                        //  temp C shallow
+  appData[appDataSize++] = (uint8_t)(wPres[0]);                               //  msb raw adc
+  appData[appDataSize++] = (uint8_t)(wPres[1]);                               //    lsb raw adc
   appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_BAT_PCT] & 0xff));  //  battery pct
 #endif
 
@@ -485,44 +519,8 @@ static void prepareTxFrame(uint8_t port) {
   //   }
 }
 
-/* process the valve state:  Check for valve off commands first, then if on command set the TxDutyCycle
- * and turn on the valve, set the timer as cycles based on new TxDutyCycle */
-void set_vlv_status() {
-  //  to turn off and reset the TxDutyCycle to prior or valve on
-  if (vlv_packet_pend.offA) {
-    controlValve(0, 0);
-    valveA->time = 0;
-    valveA->onA = 0;
-    if (valveB->offB || !valveB->onB) appTxDutyCycle = TxDutyCycle_hold;
-    LoRaWAN.cycle(appTxDutyCycle);
-  }
-  if (vlv_packet_pend.offB) {
-    controlValve(1, 0);
-    valveB->time = 0;
-    valveB->onB = 0;
-    if (valveA->offA || !valveA->onA) appTxDutyCycle = TxDutyCycle_hold;
-    LoRaWAN.cycle(appTxDutyCycle);
-  }
 
-  if (vlv_packet_pend.onA) {  //  valve A is sent command to open
-    controlValve(0, 1);
-    valveA->onA = 1;
-    valveA->time = vlv_packet_pend.time;
-    TxDutyCycle_hold = appTxDutyCycle;
-    appTxDutyCycle = CYCLE_TIME_VALVE_ON;
-    txDutyCycleTime = appTxDutyCycle + randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND);
-    LoRaWAN.cycle(txDutyCycleTime);
-  }
-  if (vlv_packet_pend.onB) {  //  valve B is sent command to open
-    controlValve(1, 1);
-    valveB->onB = 1;
-    valveB->time = vlv_packet_pend.time;
-    TxDutyCycle_hold = appTxDutyCycle;
-    appTxDutyCycle = CYCLE_TIME_VALVE_ON;
-    txDutyCycleTime = appTxDutyCycle + randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND);
-    LoRaWAN.cycle(txDutyCycleTime);
-  }
-}
+
 void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
   uint32_t TxDutyCycle_pend = 0;
   uint8_t *buf = mcpsIndication->Buffer;
@@ -537,7 +535,7 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
   revrssi = mcpsIndication->Rssi;
   revsnr = mcpsIndication->Snr;
   switch (mcpsIndication->Port) {
-
+      //  cycle time for sleeping
     case 5:
       Serial.printf("cycle-time RX port=%u len=%u bytes=%02X %02X\n",
                     (unsigned)mcpsIndication->Port, (unsigned)len,
@@ -573,17 +571,31 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
       }
 
 
-    case 6:  // valves, 2 bytes of data
-      Serial.println("in the case 6 statement for valve command pending");
-      {
-        ValveState_t tmp{};  // zero-init to avoid stale bits
-        size_t n = (len < sizeof(tmp)) ? len : sizeof(tmp);
-        memcpy(&tmp, buf, n);   // copy only what we actually received
-        vlv_packet_pend = tmp;  // commit
+    case 6:
+      {  // valves, 1–2 bytes: [time, flags] or [flags]
+        Serial.println("in the case 6 statement for valve command pending");
+        ValveState_t tmp{};  // zero-init (time=0, flags=0)
+
+        if (len >= 2) {       // expected form
+          tmp.time = buf[0];  // 10-minute units
+          tmp.flags = buf[1];
+        } else if (len == 1) {  // flags-only fallback
+          tmp.time = 0;
+          tmp.flags = buf[0];
+        } else {  // len == 0 → ignore
+          break;
+        }
+
+        memcpy((void *)&vlv_packet_pend, (const void *)&tmp, sizeof(tmp));  // ✅
+        set_vlv_status();
+        g_skip_next_decrement = true;  // <-- show the fresh time once
+        // one-shot status uplink so the DB/UI reflects the new state
+        deviceState = DEVICE_STATE_SEND;  // no LoRaWAN.cycle() here
+        g_need_display = true;
+
+        Serial.printf("DL6: time=%u, flags=0x%02X\n", tmp.time, tmp.flags);
+        break;
       }
-      set_vlv_status();
-      g_need_display = true;
-      break;
     case 7:
       {  // device name (ASCII, max 12), no-Arduino-String version
         constexpr size_t MAX_NAME = 12;
@@ -628,7 +640,7 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
         break;
       }
 
-
+      //  wake threshold changes for the ULP counter
     case 8:
       {
         uint16_t th = (mcpsIndication->BufferSize == 1)
@@ -646,28 +658,36 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
         Serial.printf("NVS write %s (wrote=%u bytes, value=%u, verify=%u)\n",
                       (w == sizeof(uint16_t)) ? "OK" : "FAIL",
                       (unsigned)w, (unsigned)th, (unsigned)v);
+        g_need_display = true;
         break;
       }  // of CASE 8
-// Downlink handler (case 22):  1/m msb, lsb, b*10 msb, lsb  (four bytes)
-case 22: {
-  if (len != 4) { Serial.println("calib ignored (len!=4)"); break; }
-  uint16_t invm = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
-  int16_t  bx10 = (int16_t)((uint16_t)buf[2] | ((uint16_t)buf[3] << 8));
-  if (invm == 0 || invm > 50000) { Serial.println("calib ignored (inv_m out of range)"); break; }
+    // Downlink handler (case 22):  1/m msb, lsb, b*10 msb, lsb  (four bytes)
+    case 22:
+      {
+        if (len != 4) {
+          Serial.println("calib ignored (len!=4)");
+          break;
+        }
+        uint16_t invm = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+        int16_t bx10 = (int16_t)((uint16_t)buf[2] | ((uint16_t)buf[3] << 8));
+        if (invm == 0 || invm > 50000) {
+          Serial.println("calib ignored (inv_m out of range)");
+          break;
+        }
 
-  inv_m_u16 = invm;      // RTC (survives deep sleep)
-  b_x10     = bx10;
+        inv_m_u16 = invm;  // RTC (survives deep sleep)
+        b_x10 = bx10;
 
-  bool ok = false;
-  if (prefs.begin("lake_cal", false)) {
-    ok  = (prefs.putUShort("inv_m_u16", inv_m_u16) == sizeof(uint16_t));
-    ok &= (prefs.putShort ("b_x10",     b_x10    ) == sizeof(int16_t));
-    prefs.end();
-  }
-  Serial.printf("calib %s: inv_m=%u cnt/m  b=%.1f m\n", ok ? "stored" : "FAILED",
-                inv_m_u16, b_x10/10.0f);
-  break;
-}
+        bool ok = false;
+        if (prefs.begin("lake_cal", false)) {
+          ok = (prefs.putUShort("inv_m_u16", inv_m_u16) == sizeof(uint16_t));
+          ok &= (prefs.putShort("b_x10", b_x10) == sizeof(int16_t));
+          prefs.end();
+        }
+        Serial.printf("calib %s: inv_m=%u cnt/m  b=%.1f m\n", ok ? "stored" : "FAILED",
+                      inv_m_u16, b_x10 / 10.0f);
+        break;
+      }
 
   }  // of switch
   revrssi = mcpsIndication->Rssi;
@@ -836,50 +856,73 @@ static const ulp_insn_t ulp_program[] = {
 };
 
 static void rs485_spin() {
-for(;;) { RS485Send(0); delay(1000); }
+  for (;;) {
+    RS485Send(0);
+    delay(1000);
+  }
 }
 
 void setup() {
 
   Serial.begin(115200);
-    delay(500);
+  delay(500);
   // Debugging: Check the appPort value
   Serial.print("App Port is set to: ");
   Serial.println(appPort);  // This should print 11 for SOIL_SENSOR_NODE
 
- 
+
   hardware_pins_init();  //
   setPowerEnable(1);
 
   //Serial.printf("LORAWAN_APP_DATA_MAX_SIZE = %u\n", (unsigned)LORAWAN_APP_DATA_MAX_SIZE);
 
-// help weak/long pull-ups
-pinMode(PIN_SDA, INPUT_PULLUP);
-pinMode(PIN_SCL, INPUT_PULLUP);
-delay(50);  // rail settle
+  // while(1){
+  //   Serial.printf("vlv A on\n");
+  //   controlValve(0,0);
+  //   delay(4000);
+  //      Serial.printf("vlv A off\n");
+  //       controlValve(0,1);
+  //   delay(4000);
+  //       Serial.printf(" vlv B on\n");
+  //       controlValve(1,0);
+  //   delay(3000);
+  //           Serial.printf(" vlv B off\n");
+  //       controlValve(1,1);
+  //   delay(3000);
+  // }
 
-// retry-probe window (~300 ms)
-uint32_t deadline = millis() + 300;
-bool found = false;
-do {
-  Wire.end();
-  Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.beginTransmission(0x68);
-  if (Wire.endTransmission() == 0) { found = true; break; }
-
-  // simple bus recovery if SDA stuck low
-  pinMode(PIN_SCL, OUTPUT);
-  for (int i = 0; i < 9 && digitalRead(PIN_SDA) == LOW; ++i) {
-    digitalWrite(PIN_SCL, LOW); delayMicroseconds(5);
-    digitalWrite(PIN_SCL, HIGH); delayMicroseconds(5);
-  }
+  // help weak/long pull-ups
+  pinMode(PIN_SDA, INPUT_PULLUP);
   pinMode(PIN_SCL, INPUT_PULLUP);
-  delay(20);
-} while ((int32_t)(millis() - deadline) < 0);
+  delay(50);  // rail settle
 
-bool i2c_ready = found;
-Serial.printf("I2C 0x68 %s\n", i2c_ready ? "OK" : "NACK");
-// three lines set up the display
+  // retry-probe window (~300 ms)
+  uint32_t deadline = millis() + 300;
+  bool found = false;
+  do {
+    Wire.end();
+    Wire.begin(PIN_SDA, PIN_SCL);
+    Wire.beginTransmission(0x68);
+    if (Wire.endTransmission() == 0) {
+      found = true;
+      break;
+    }
+
+    // simple bus recovery if SDA stuck low
+    pinMode(PIN_SCL, OUTPUT);
+    for (int i = 0; i < 9 && digitalRead(PIN_SDA) == LOW; ++i) {
+      digitalWrite(PIN_SCL, LOW);
+      delayMicroseconds(5);
+      digitalWrite(PIN_SCL, HIGH);
+      delayMicroseconds(5);
+    }
+    pinMode(PIN_SCL, INPUT_PULLUP);
+    delay(20);
+  } while ((int32_t)(millis() - deadline) < 0);
+
+  i2c_ready = found;
+  Serial.printf("I2C 0x68 %s\n", i2c_ready ? "OK" : "NACK");
+  // three lines set up the display
   // if (!sht4.begin()) {
   //   Serial.println("Couldn't find SHT40");
   //   } else{
@@ -896,7 +939,7 @@ Serial.printf("I2C 0x68 %s\n", i2c_ready ? "OK" : "NACK");
   if ((++epd_hygiene % 50) == 0) display.clear();  //  rest the screen ever 50 cycles to clean up any isssues.
   display.screenRotate(ANGLE_180_DEGREE);
   display.setFont(ArialMT_Plain_24);
-  //heap_caps_check_integrity_all(true);
+
   // configure RTC GPIO, enable ULP wake up.
   ESP_ERROR_CHECK(rtc_gpio_hold_dis(RTC_GPIO_SENSOR_PIN));
   ESP_ERROR_CHECK(rtc_gpio_init(RTC_GPIO_SENSOR_PIN));
@@ -913,10 +956,11 @@ Serial.printf("I2C 0x68 %s\n", i2c_ready ? "OK" : "NACK");
   switch (cause) {
     case ESP_SLEEP_WAKEUP_ULP:
       {
-        // ── ULP woke us up 
+        // ── ULP woke us up
         uint32_t count = read_count32();
 
         Serial.printf("Woke by ULP reed trigger, pulse count = %u\n", count);
+        g_need_display = true;
       }
       break;
 
@@ -925,18 +969,24 @@ Serial.printf("I2C 0x68 %s\n", i2c_ready ? "OK" : "NACK");
         // ── timer woke us up
         uint32_t count = read_count32();
         Serial.printf("Woke by RTC TIMER, pulse count = %u\n", count);
+        g_need_display = true;
       }
       break;
 
     case ESP_SLEEP_WAKEUP_UNDEFINED:  //  THIS IS COLD RESTART
       {
-        //display.drawString(0, 40, "Connecting -> LoRaWAN");
-        //display.display();
+        TxDutyCycle_hold = 10800000;  //  3 hr backup
+                                      //display.display();
+        g_need_display = true;
 #if !defined(VALVE_NODE)
         valveA->onA = 0;
         valveB->onB = 0;  // e.g., set to 0
 #endif
-        initialCycleFast = 5;  //  fast cycle the first x times to help with initial config
+#if defined(VALVE_NODE)  // start with valves sent a close command.
+        controlValve(0, 0);
+        controlValve(1, 0);
+#endif
+        initialCycleFast = 10;  //  fast cycle the first x times to help with initial config
         memset(RTC_SLOW_MEM, 0, CONFIG_ULP_COPROC_RESERVE_MEM);
         // see if we have a stored wake threshold
         uint16_t th = PULSE_THRESHOLD;   // default
@@ -959,13 +1009,13 @@ Serial.printf("I2C 0x68 %s\n", i2c_ready ? "OK" : "NACK");
         }  //  of if
            //  clear and then load and then kick off the ULP
 
-// Cold-boot restore (ESP_SLEEP_WAKEUP_UNDEFINED case)
-if (prefs.begin("lake_cal", true)) {
-  inv_m_u16 = prefs.getUShort("inv_m_u16", inv_m_u16);
-  b_x10     = prefs.getShort ("b_x10",     b_x10);
-  prefs.end();
-  Serial.printf("Calib restored: inv_m=%u cnt/m  b=%.1f m\n", inv_m_u16, b_x10/10.0f);
-}
+        // Cold-boot restore (ESP_SLEEP_WAKEUP_UNDEFINED case)
+        if (prefs.begin("lake_cal", true)) {
+          inv_m_u16 = prefs.getUShort("inv_m_u16", inv_m_u16);
+          b_x10 = prefs.getShort("b_x10", b_x10);
+          prefs.end();
+          Serial.printf("Calib restored: inv_m=%u cnt/m  b=%.1f m\n", inv_m_u16, b_x10 / 10.0f);
+        }
 
         size_t size = sizeof(ulp_program) / sizeof(ulp_insn_t);
         esp_err_t result = ulp_process_macros_and_load(ULP_PROG_START, ulp_program, &size);
@@ -981,26 +1031,25 @@ if (prefs.begin("lake_cal", true)) {
       {
         uint32_t count = read_count32();
         Serial.printf("Woke by DEFAULT, pulse count = %u\n", count);
+        g_need_display = true;
       }
       break;
   }  // case
 
   Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
   Serial.printf("wake up case completed, LORAWAN_APP_DATA_MAX_SIZE = %u\n", (unsigned)LORAWAN_APP_DATA_MAX_SIZE);
-  g_need_display = true;
   delay(100);
 
-#if defined(LAKE_NODE)
-  initRS485(4800);
-#endif
-#if defined(SOIL_SENSOR_NODE)
+
+#if defined(SOIL_SENSOR_NODE) || defined(LAKE_NODE)
   Serial.println("initRS485(9600)");
   initRS485(9600);
 #endif
 
-    Serial.println("BOOT: after HELTEC_B start, Serial ready");
-// after Mcu.begin(...) and your Serial re-begin
-// rs485_uart_loopback_test(9600);   // one-shot self-test
+  Serial.println("BOOT: after HELTEC_B start, Serial ready");
+
+  // after Mcu.begin(...) and your Serial re-begin
+  // rs485_uart_loopback_test(9600);   // one-shot self-test
 
 };  // of function
 
@@ -1010,85 +1059,50 @@ void loop() {
     case DEVICE_STATE_INIT:
       {
         LoRaWAN.init(loraWanClass, loraWanRegion);
-        // both set join DR and DR when ADR off
         LoRaWAN.setDefaultDR(3);
         break;
       }
     case DEVICE_STATE_JOIN:
       {
+        // STOCK: let the MAC handle RX windows
+        //Serial.println("In JOIN");
+        join_inflight = true;  // [CHANGE] flag OTAA in progress
         LoRaWAN.join();
         break;
       }
     case DEVICE_STATE_SEND:
       {
+        //  Join succeeded → clear inflight so UI can run again safely
+        join_inflight = false;
+        //Serial.println("In SEND");
+        // STOCK: build payload, send, then advance to CYCLE
         prepareTxFrame(appPort);
         LoRaWAN.send();
-        deviceState = DEVICE_STATE_CYCLE; // ← advance state; don’t rely on the lib
-        // [GPT] trigger a render after every uplink; actual drawing happens outside the switch
-
-        if (g_need_display) {
-          if (!g_last_tx_ms || (int32_t)(millis() - g_last_tx_ms) >= 5000) {
-            g_need_display = false;
-            g_last_tx_ms = 0;
-            display_status();
-          }
-          g_need_display = true; // draw after RX windows
-        }
+        deviceState = DEVICE_STATE_CYCLE;
         break;
       }
-        case DEVICE_STATE_CYCLE:
-          {
-            // 1) Apply explicit schedule override from downlink (case 5)
-            if (g_sched_override_ms) {
-              const uint32_t ms = g_sched_override_ms;  // snapshot once
-              g_sched_override_ms = 0;                  // consume override (one-shot)
-              appTxDutyCycle = ms;                      // keep canonical schedule updated
-              txDutyCycleTime = ms;                     // keep derived var in sync
-              Serial.printf("next cycle (override): %lu ms\n", (unsigned long)ms);
-              LoRaWAN.cycle(ms);
-              deviceState = DEVICE_STATE_SLEEP;
-              break;
-            }
-
-            // 2) Post-join fast burst to let ADR settle
-            if (initialCycleFast) {
-              initialCycleFast--;
-              uint32_t fast = TX_CYCLE_FAST_TIME + (uint32_t)randr(0, 2000);  // +0..2 s jitter
-              LoRaWAN.cycle(fast);
-              deviceState = DEVICE_STATE_SLEEP;
-              break;
-            }
-
-            // 3) Normal schedule with jitter (safe clamp)
-            const int32_t j = randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND);
-            uint32_t base = appTxDutyCycle;         // canonical ms
-            int32_t trial = (int32_t)base + j;      // signed math for safety
-            if (trial <= 0) trial = (int32_t)base;  // no negative / zero intervals
-            // Optional: upper clamp if you have a max, e.g., MAX_TX_MS
-            // if (trial > (int32_t)MAX_TX_MS) trial = (int32_t)MAX_TX_MS;
-            txDutyCycleTime = (uint32_t)trial;
-
-            LoRaWAN.cycle(txDutyCycleTime);
-            deviceState = DEVICE_STATE_SLEEP;
-            break;
-          }
-
-        case DEVICE_STATE_SLEEP:
-          {
-            if (g_last_tx_ms && (int32_t)(millis() - g_last_tx_ms) < 5000) break;  // wait out RX window first
-            LoRaWAN.sleep(loraWanClass);
-            break;
-          }
-        default:
-          {
-            deviceState = DEVICE_STATE_INIT;
-            break;
-          }
-      }  // of switch
-      // [GPT] single draw point so RX callback stays light and we still refresh the screen
-      if (g_need_display) {
-        g_need_display = false;
-        display_status();
+    case DEVICE_STATE_CYCLE:
+      {
+        //Serial.println("In CYCLE");
+        txDutyCycleTime = appTxDutyCycle + randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND);
+        LoRaWAN.cycle(txDutyCycleTime);  // respects valve-open hold/restore
+        deviceState = DEVICE_STATE_SLEEP;
+        break;
       }
-  }  // of loop function
-
+    case DEVICE_STATE_SLEEP:
+      {
+        //Serial.println("In SLEEP");
+        if (!join_inflight && g_need_display) {
+          display_status();  // blocking is fine now
+          g_need_display = false;
+        }
+        LoRaWAN.sleep(loraWanClass);
+        break;
+      }
+    default:
+      {
+        deviceState = DEVICE_STATE_INIT;
+        break;
+      }
+  }
+}  // of loop function

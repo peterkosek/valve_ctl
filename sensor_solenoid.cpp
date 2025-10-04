@@ -1,64 +1,80 @@
 #include "esp32-hal-adc.h"
 #include "sensor_solenoid.h"
-#include "esp32s3/ulp.h"  //  this also includes ulp_common.h 
+#include "esp32s3/ulp.h"  //  this also includes ulp_common.h
 #include <HardwareSerial.h>
 #include <stdbool.h>
 #include "driver/uart.h"
 #include <Arduino.h>
 
 // Define your pin constants somewhere accessible:
+// ---- Hardware mapping (Heltec E290 / ESP32-S3) ----
+static const int PIN_TX = PIN_RS485_TX;  // UART1 TXD
+static const int PIN_RX = PIN_RS485_RX;  // UART1 RXD
+static const int PIN_RTS = RS485_DE;     // RS-485 DE/RE (wired together), driven by RTS
 
-#define RS485_SERIAL    Serial2
+// ---- Modbus settings ----
+static const uint8_t SLAVE_ID = 0x01;
+static const uint32_t BAUDRATE = 9600;
+static const uint16_t REG_START = 0x0000;  // holding register start
+static const uint16_t REG_COUNT = 1;       // read one 16-bit register
+
+extern uint32_t TxDutyCycle_hold;
+extern uint32_t appTxDutyCycle;
+extern uint32_t txDutyCycleTime;
+// Modbus master instance
+
+#define RS485_SERIAL Serial1
 #define RS485_TX_ENABLE RS485_DE
+#define RS485_EN RS485_DE
+constexpr uart_port_t RS485_PORT = UART_NUM_1;  // match Serial1
 
 CMCP3421 adc(0.1692);
 
-uint8_t aTxBuffer0[8] = { 0x01, 0x03, 0x00, 0x01, 0x00, 0x02, 0x95, 0xcb }; // first soil moisture sensor message
-uint8_t aTxBuffer1[8] = { 0x02, 0x03, 0x00, 0x01, 0x00, 0x02, 0x95, 0xf8 }; //  second soil moisture message
+uint8_t aTxBuffer0[8] = { 0x01, 0x03, 0x00, 0x01, 0x00, 0x02, 0x95, 0xcb };  // first soil moisture sensor message
+uint8_t aTxBuffer1[8] = { 0x02, 0x03, 0x00, 0x01, 0x00, 0x02, 0x95, 0xf8 };  //  second soil moisture message
 uint8_t aTxBuffer3[8] = { 0x01, 0x03, 0x00, 0x00, 0x00, 0x0a, 0xc5, 0xcd };  //  for three metal proble soil moisture sensor
 uint8_t aTxBuffer4[8] = { 0x01, 0x03, 0x00, 0x04, 0x00, 0x01, 0xc5, 0xcb };  //  for three metal proble soil moisture sensor
 uint8_t aSoilSensShallow[] = { 0x01, 0x03, 0x00, 0x00, 0x00, 0x04, 0x44, 0x09 };
-uint8_t aSoilSensDeep[]    = { 0x02, 0x03, 0x00, 0x00, 0x00, 0x04, 0x44, 0x3a };
+uint8_t aSoilSensDeep[] = { 0x02, 0x03, 0x00, 0x00, 0x00, 0x04, 0x44, 0x3a };
 // Query to read 2 input registers (pressure), from address 0x0001
-const uint8_t depthQuery[8] = { 0x01, 0x03, 0x00, 0x00, 0x00, 0x0a, 0xc5, 0xcd };
-uint8_t wPres[2] = {0x01, 0x02}; // raw uncalibrated adc output
-uint8_t sTempC[4], sMoist[4];   //  for final data from soil probes
-uint8_t aRx[10];    //  for rs-485 returned data from soil probes
-uint8_t soilSensorOut[6];  //  for the two soil sensors including moisture, temp and pH
+const uint8_t depthQuery[8] = { 0x01, 0x03, 0x00, 0x04, 0x00, 0x01, 0xC5, 0xCB };
+uint8_t wPres[2] = { 0x01, 0x02 };  // raw uncalibrated adc output
+uint8_t sTempC[4], sMoist[4];       //  for final data from soil probes
+uint8_t aRx[10];                    //  for rs-485 returned data from soil probes
+uint8_t soilSensorOut[6];           //  for the two soil sensors including moisture, temp and pH
 extern uint8_t bat_pct;
-extern HardwareSerial Serial1;
 
-// forward decl 
+// forward decl
 static void dumpHex(const char* tag, const uint8_t* buf, size_t len);
 
 
 
 // Hardware pin setup
 void hardware_pins_init(void) {
-    // Set input pins
-    pinMode(PIN_VE_CTL, OUTPUT);
-    digitalWrite(PIN_VE_CTL, HIGH); // power to external functions of the MCU
-    pinMode(PIN_REED_P, INPUT_PULLUP);
-    pinMode(RS485_DE, OUTPUT);
-    pinMode(ADC_CTL_PIN, OUTPUT);
+  // Set input pins
+  pinMode(PIN_VE_CTL, OUTPUT);
+  digitalWrite(PIN_VE_CTL, HIGH);  // power to external functions of the MCU
+  pinMode(PIN_REED_P, INPUT_PULLUP);
+  pinMode(RS485_DE, OUTPUT);
+  digitalWrite(RS485_DE, LOW);  // listen
+  pinMode(ADC_CTL_PIN, OUTPUT);
 
-    pinMode(VBAT_READ_PIN, INPUT);  // not needed
-    analogSetPinAttenuation(VBAT_READ_PIN,ADC_2_5db);  //  6db reduces voltage to 1/2 of input
+  pinMode(VBAT_READ_PIN, INPUT);                      // not needed
+  analogSetPinAttenuation(VBAT_READ_PIN, ADC_2_5db);  //  6db reduces voltage to 1/2 of input
 
-    pinMode(EPD_BUSY_PIN, INPUT);  //  status of the  epaper
-    //analogReadResolution(12); // 12 bit res
-    // Set solenoid control pins as outputs, start is locked high Z state
-    pinMode(PIN_IN1, OUTPUT);
-    pinMode(PIN_IN2, OUTPUT);
-    pinMode(PIN_IN3, OUTPUT);
-    pinMode(PIN_IN4, OUTPUT);
+  pinMode(EPD_BUSY_PIN, INPUT);  //  status of the  epaper
+  //analogReadResolution(12); // 12 bit res
+  // Set solenoid control pins as outputs, start is locked high Z state
+  pinMode(PIN_IN1, OUTPUT);
+  pinMode(PIN_IN2, OUTPUT);
+  pinMode(PIN_IN3, OUTPUT);
+  pinMode(PIN_IN4, OUTPUT);
 
-    // Set EN_PWR as output, and start with this on
-    pinMode(PIN_EN_SENSE_PWR, OUTPUT);
-    digitalWrite(PIN_EN_SENSE_PWR, HIGH);
-    // Set up UART pins if needed separately
-    // (Typically UART driver will configure TX/RX pins automatically)
-
+  // Set EN_PWR as output, and start with this on
+  pinMode(PIN_EN_SENSE_PWR, OUTPUT);
+  digitalWrite(PIN_EN_SENSE_PWR, HIGH);
+  // Set up UART pins if needed separately
+  // (Typically UART driver will configure TX/RX pins automatically)
 }
 
 // Map valves 1→index 0, 2→index 1
@@ -67,23 +83,24 @@ static const uint8_t reversePins[] = { PIN_IN2, PIN_IN4 };
 static const size_t valveCount = sizeof(forwardPins) / sizeof(forwardPins[0]);
 
 void controlValve(uint8_t valve_number, uint8_t status) {
-    if (valve_number < 0 || valve_number > 1) return;
+  if (valve_number >= valveCount) return;
 
-    size_t idx = valve_number;
-    uint8_t pinF = forwardPins[idx];
-    uint8_t pinR = reversePins[idx];
+  const uint8_t pinF = forwardPins[valve_number];
+  const uint8_t pinR = reversePins[valve_number];
 
-    digitalWrite(pinF, status ? HIGH : LOW);
-    digitalWrite(pinR, status ? LOW  : HIGH);
+  // drive for the pulse
+  digitalWrite(pinF, status ? HIGH : LOW);   // 1=ON, 0=OFF
+  digitalWrite(pinR, status ? LOW  : HIGH);
 
-    delay(200);
+  delay(120);
 
-    digitalWrite(pinF, LOW);
-    digitalWrite(pinR, LOW);
+  // release to LOW (coast) for drv 8871
+  digitalWrite(pinF, LOW);   // 
+  digitalWrite(pinR, LOW);   // 
 }
 
 // return a 8 bit '% charged' that is  proportional to the range of voltages from 3.5 to 4.1
-uint8_t bat_cap8(){
+uint8_t bat_cap8() {
   const int16_t mid = 850;
   const int16_t span = 150;  // 1000–850
 
@@ -94,12 +111,12 @@ uint8_t bat_cap8(){
   Serial.printf("read bat_cap8() pin_adc_ctl HIGH = %u\n", raw);
   digitalWrite(ADC_CTL_PIN, LOW);
 
-  int16_t diff = raw - mid;                // –∞…+∞
-  if (diff < 0) diff = -diff;              // abs(diff)
+  int16_t diff = raw - mid;    // –∞…+∞
+  if (diff < 0) diff = -diff;  // abs(diff)
   uint16_t udiff = (uint16_t)diff;
   // now scale 0…150 → 0…100
   uint16_t pct = uint16_t(diff * 100 / span);
-  if (pct > 100) pct = 100;                // clamp
+  if (pct > 100) pct = 100;  // clamp
 
   RTC_SLOW_MEM[ULP_BAT_PCT] = pct;  //  ULP_BAT_PCT is defined in the .h
   return ((uint8_t)(pct * 2.55));   //  lorawan.cpp wants this full byte form
@@ -107,18 +124,18 @@ uint8_t bat_cap8(){
 
 // Replaces your readMCP3421avg_cont() with error handling and timeouts.
 uint16_t readMCP3421avg_cont() {
-  const uint8_t addr    = 0x68;
-  const uint8_t cfgCont = 0b10011000; // continuous, 16-bit, PGA=1
+  const uint8_t addr = 0x68;
+  const uint8_t cfgCont = 0b10011000;  // continuous, 16-bit, PGA=1
   const uint8_t samples = 8;
   const uint32_t rdy_timeout_ms = 200;  // 16-bit conversion ≈ 67 ms → 200 ms cap
-  const uint32_t poll_delay_ms  = 5;
+  const uint32_t poll_delay_ms = 5;
 
   // Persist across calls
-  static uint8_t  fail_streak = 0;
-  static uint16_t last_good   = 0;      // 0 until first valid read
+  static uint8_t fail_streak = 0;
+  static uint16_t last_good = 0;  // 0 until first valid read
 
   int32_t sum = 0;
-  uint8_t ok  = 0;
+  uint8_t ok = 0;
 
   // Start continuous conversions (ignore non-zero return as soft error)
   Wire.beginTransmission(addr);
@@ -131,8 +148,8 @@ uint16_t readMCP3421avg_cont() {
     for (;;) {
       int n = Wire.requestFrom(addr, (uint8_t)3);
       if (n == 3) {
-        uint8_t msb  = Wire.read();
-        uint8_t lsb  = Wire.read();
+        uint8_t msb = Wire.read();
+        uint8_t lsb = Wire.read();
         uint8_t stat = Wire.read();
 
         // RDY==0 → data valid
@@ -140,7 +157,7 @@ uint16_t readMCP3421avg_cont() {
           int16_t raw = (int16_t)((uint16_t)msb << 8 | lsb);
           sum += raw;
           ok++;
-          break; // next sample
+          break;  // next sample
         }
       } else {
         // drain any partial bytes to keep the bus clean
@@ -178,19 +195,19 @@ uint16_t readMCP3421avg_cont() {
 
 // Assume PIN_EN_SENSE_PWR was pinMode’d to OUTPUT in setup()
 void setPowerEnable(uint8_t powerState) {
-    digitalWrite(PIN_EN_SENSE_PWR, powerState ? HIGH : LOW);
+  digitalWrite(PIN_EN_SENSE_PWR, powerState ? HIGH : LOW);
 }
 
 void RS485Sub(uint8_t depth);
 
 static const uint8_t* const buffers[] = { aTxBuffer0, aTxBuffer1 };
-static const size_t      bufLens[] = { sizeof(aTxBuffer0), sizeof(aTxBuffer1) };
+static const size_t bufLens[] = { sizeof(aTxBuffer0), sizeof(aTxBuffer1) };
 
 // CHANGED: enforce Modbus silent gap and TX→RX turnaround
 void RS485Send(uint8_t depth) {
   if (depth > 1) return;
-  const uint32_t t_char_us = (11UL * 1000000UL) / 9600; // 1 char at 9600 baud
-  const uint32_t t3_5_us   = (35UL * t_char_us) / 10UL;
+  const uint32_t t_char_us = (11UL * 1000000UL) / 9600;  // 1 char at 9600 baud
+  const uint32_t t3_5_us = (35UL * t_char_us) / 10UL;
 
   // Pre-frame silence
   delayMicroseconds(t3_5_us);
@@ -209,10 +226,10 @@ void RS485Send(uint8_t depth) {
 //helper to send raw frame with silent gap and TX→RX turnaround
 static void RS485SendFrame(const uint8_t* frame, size_t len, uint32_t baud = 9600) {
   const uint32_t t_char_us = (11UL * 1000000UL) / baud;
-  const uint32_t t3_5_us   = (35UL * t_char_us) / 10UL;
+  const uint32_t t3_5_us = (35UL * t_char_us) / 10UL;
   delayMicroseconds(t3_5_us);
   delay(10);
-    // print TX frame before driving DE high
+  // print TX frame before driving DE high
   dumpHex("TX", frame, len);
   digitalWrite(RS485_DE, HIGH);
   delayMicroseconds(t3_5_us);
@@ -226,123 +243,107 @@ static void RS485SendFrame(const uint8_t* frame, size_t len, uint32_t baud = 960
 
 // generic Modbus RTU read (function 0x03)
 bool readModbusFrame_dbg(const char* file, int line,
-uint8_t addr, uint16_t startReg, uint16_t regCount,
-uint8_t* outBuf, size_t outMax,
-uint32_t baud, uint32_t frame_timeout_ms) {
-Serial.printf("TX req @%s:%d -> addr=%u start=0x%04X regs=%u\n", file, line, addr, startReg, regCount);
+                         uint8_t addr, uint16_t startReg, uint16_t regCount,
+                         uint8_t* outBuf, size_t outMax,
+                         uint32_t baud, uint32_t frame_timeout_ms) {
+  Serial.printf("TX req @%s:%d -> addr=%u start=0x%04X regs=%u\n", file, line, addr, startReg, regCount);
 
 
-    uint8_t req[8];
-    req[0] = addr;
-    req[1] = 0x03;
-    req[2] = (startReg >> 8) & 0xFF;
-    req[3] = startReg & 0xFF;
-    req[4] = (regCount >> 8) & 0xFF;
-    req[5] = regCount & 0xFF;
-    uint16_t crc = modbusCRC(req,6);
-    req[6] = crc & 0xFF;
-    req[7] = (crc >> 8) & 0xFF;
+  uint8_t req[8];
+  req[0] = addr;
+  req[1] = 0x03;
+  req[2] = (startReg >> 8) & 0xFF;
+  req[3] = startReg & 0xFF;
+  req[4] = (regCount >> 8) & 0xFF;
+  req[5] = regCount & 0xFF;
+  uint16_t crc = modbusCRC(req, 6);
+  req[6] = crc & 0xFF;
+  req[7] = (crc >> 8) & 0xFF;
 
-    Serial.printf("TX req: addr=%u start=0x%04X regs=%u\n", addr, startReg, regCount);
-    RS485SendFrame(req, sizeof(req), baud);
+  Serial.printf("TX req: addr=%u start=0x%04X regs=%u\n", addr, startReg, regCount);
+  RS485SendFrame(req, sizeof(req), baud);
 
-    // expected normal reply length for function 0x03
-    const size_t expected = 1 + 1 + 1 + (2 * regCount) + 2; // addr + fc + byteCount + data + crc
-    if (expected > outMax) return false;
+  // expected normal reply length for function 0x03
+  const size_t expected = 1 + 1 + 1 + (2 * regCount) + 2;  // addr + fc + byteCount + data + crc
+  if (expected > outMax) return false;
 
-    RS485_SERIAL.setTimeout(frame_timeout_ms);
-    size_t len = RS485_SERIAL.readBytes(outBuf, expected);
-    Serial.printf("RX %u/%u bytes\n", (unsigned)len, (unsigned)expected);
+  RS485_SERIAL.setTimeout(frame_timeout_ms);
+  size_t len = RS485_SERIAL.readBytes(outBuf, expected);
+  Serial.printf("RX %u/%u bytes\n", (unsigned)len, (unsigned)expected);
 
-    if (len > 0) dumpHex("RX", outBuf, len);
+  if (len > 0) dumpHex("RX", outBuf, len);
 
-    // NEW: handle Modbus exception frame (5 bytes: addr, 0x83, code, CRClo, CRChi)
-    if (len == 5 && (outBuf[1] == (0x80 | 0x03))) {
-        uint16_t exc_crc = modbusCRC(outBuf, 3);
-        uint16_t exc_rx  = (uint16_t)outBuf[3] | ((uint16_t)outBuf[4] << 8);
-        if (exc_crc == exc_rx) {
-            Serial.printf("Modbus exception: code=0x%02X (addr=%u)\n", outBuf[2], outBuf[0]);
-        } else {
-            Serial.println("Exception frame CRC mismatch");
-        }
-        return false;
+  // NEW: handle Modbus exception frame (5 bytes: addr, 0x83, code, CRClo, CRChi)
+  if (len == 5 && (outBuf[1] == (0x80 | 0x03))) {
+    uint16_t exc_crc = modbusCRC(outBuf, 3);
+    uint16_t exc_rx = (uint16_t)outBuf[3] | ((uint16_t)outBuf[4] << 8);
+    if (exc_crc == exc_rx) {
+      Serial.printf("Modbus exception: code=0x%02X (addr=%u)\n", outBuf[2], outBuf[0]);
+    } else {
+      Serial.println("Exception frame CRC mismatch");
     }
+    return false;
+  }
 
-    // For a normal reply, we must have the full expected length
-    if (len != expected) return false;
+  // For a normal reply, we must have the full expected length
+  if (len != expected) return false;
 
-    // Basic header checks
-    if (outBuf[0] != addr || outBuf[1] != 0x03) return false;
+  // Basic header checks
+  if (outBuf[0] != addr || outBuf[1] != 0x03) return false;
 
-    // NEW: verify device-reported byte count matches requested register count
-    if (outBuf[2] != (regCount * 2)) {
-        Serial.printf("Byte count mismatch: got=%u expected=%u\n", outBuf[2], (unsigned)(regCount * 2));
-        return false;
-    }
+  // NEW: verify device-reported byte count matches requested register count
+  if (outBuf[2] != (regCount * 2)) {
+    Serial.printf("Byte count mismatch: got=%u expected=%u\n", outBuf[2], (unsigned)(regCount * 2));
+    return false;
+  }
 
-    // CRC check
-    uint16_t rx_crc = (uint16_t)outBuf[len - 2] | ((uint16_t)outBuf[len - 1] << 8);
-    uint16_t calced = modbusCRC(outBuf, len - 2);
-    if (rx_crc != calced) return false;
+  // CRC check
+  uint16_t rx_crc = (uint16_t)outBuf[len - 2] | ((uint16_t)outBuf[len - 1] << 8);
+  uint16_t calced = modbusCRC(outBuf, len - 2);
+  if (rx_crc != calced) return false;
 
-    return true;
+  return true;
 }
 
 
 bool readFrame(uint8_t depth, uint8_t header, int& outIdx) {
-    constexpr uint8_t maxRetries = 3;
-    for (uint8_t attempt = 0; attempt < maxRetries; attempt++) {
-        RS485Sub(depth);
-        memset(aRx, 0, sizeof(aRx));
-        size_t len = Serial2.readBytes(aRx, sizeof(aRx));
-        for (int i = 0; i + 3 < len; i++) {
-            if (aRx[i] == header && aRx[i+1] == 0x03 && aRx[i+2] == 0x04) {
-                outIdx = i;
-                return true;
-            }
-        }
+  constexpr uint8_t maxRetries = 3;
+  for (uint8_t attempt = 0; attempt < maxRetries; attempt++) {
+    RS485Sub(depth);
+    memset(aRx, 0, sizeof(aRx));
+    size_t len = Serial2.readBytes(aRx, sizeof(aRx));
+    for (int i = 0; i + 3 < len; i++) {
+      if (aRx[i] == header && aRx[i + 1] == 0x03 && aRx[i + 2] == 0x04) {
+        outIdx = i;
+        return true;
+      }
     }
-    return false;
+  }
+  return false;
 }
 
 void RS485Get() {
-    uint8_t buf[64];
+  uint8_t buf[64];
 
-    if(readModbusFrame(0x01,0x0001,2,buf,sizeof(buf))) {
-        sTempC[0] = buf[3];
-        sTempC[1] = buf[4];
-        sMoist[0] = buf[5];
-        sMoist[1] = buf[6];
-    }
+  if (readModbusFrame(0x01, 0x0001, 2, buf, sizeof(buf))) {
+    sTempC[0] = buf[3];
+    sTempC[1] = buf[4];
+    sMoist[0] = buf[5];
+    sMoist[1] = buf[6];
+  }
 
-    if(readModbusFrame(0x02,0x0001,2,buf,sizeof(buf))) {
-        sTempC[2] = buf[3];
-        sTempC[3] = buf[4];
-        sMoist[2] = buf[5];
-        sMoist[3] = buf[6];
-    }
+  if (readModbusFrame(0x02, 0x0001, 2, buf, sizeof(buf))) {
+    sTempC[2] = buf[3];
+    sTempC[3] = buf[4];
+    sMoist[2] = buf[5];
+    sMoist[3] = buf[6];
+  }
 }
 
 
 void initRS485(uint16_t baud) {
-  RS485_SERIAL.begin(baud, SERIAL_8N1, 44, 43);  // RX=44, TX=43
-  // CHANGED: hard bind UART2 to GPIOs (avoids any Arduino/Heltec re-mux weirdness)
-  uart_set_pin(UART_NUM_2,
-             (gpio_num_t)43,  // TX
-             (gpio_num_t)44,  // RX
-             UART_PIN_NO_CHANGE,
-             UART_PIN_NO_CHANGE);
-  uart_set_line_inverse(UART_NUM_2, UART_SIGNAL_INV_DISABLE);
-  Serial.println("UART2 pin bind: TX=43 RX=44");
-
-  pinMode(RS485_TX_ENABLE, OUTPUT);
-  digitalWrite(RS485_TX_ENABLE, LOW); // Listen by default
-
-  // testing only: scope probe: drive DE and send 0x55 once
-  digitalWrite(RS485_TX_ENABLE, HIGH);     // enable driver
-  RS485_SERIAL.write(0x55);
-  RS485_SERIAL.flush(true);
-  digitalWrite(RS485_TX_ENABLE, LOW);      // back to RX
+  RS485_SERIAL.end();
+  RS485_SERIAL.begin(baud, SERIAL_8N1, PIN_RS485_RX, PIN_RS485_TX);  // RX=44, TX=43
 }
 
 // ADDED: simple UART loopback self-test (TX->RX jumper at MCU pins 43↔44)
@@ -352,14 +353,14 @@ void rs485_uart_loopback_test(uint32_t baud = 9600) {
 
   // Ensure RS-485 transceiver is NOT driving the bus
   pinMode(RS485_DE, OUTPUT);
-  digitalWrite(RS485_DE, LOW);     // TX driver off, RX enabled (since DE=/RE tied)
+  digitalWrite(RS485_DE, LOW);  // TX driver off, RX enabled (since DE=/RE tied)
 
   RS485_SERIAL.end();
   RS485_SERIAL.begin(baud, SERIAL_8N1, PIN_RS485_RX, PIN_RS485_TX);
 
   // Known pattern
-  const uint8_t tx[] = { 0x55,0xAA,0x12,0x34,0xBE,0xEF,0x00,0xFF,0x5A,0xA5,0xDE,0xAD,0xC0,0xDE,0x13,0x37 };
-  uint8_t rx[sizeof(tx)] = {0};
+  const uint8_t tx[] = { 0x55, 0xAA, 0x12, 0x34, 0xBE, 0xEF, 0x00, 0xFF, 0x5A, 0xA5, 0xDE, 0xAD, 0xC0, 0xDE, 0x13, 0x37 };
+  uint8_t rx[sizeof(tx)] = { 0 };
 
   // Flush & send
   RS485_SERIAL.flush();
@@ -367,64 +368,103 @@ void rs485_uart_loopback_test(uint32_t baud = 9600) {
   RS485_SERIAL.flush();
 
   // Read back exactly the same number of bytes
-  RS485_SERIAL.setTimeout(100);            // 100 ms should be plenty for 16 bytes @ 9600
+  RS485_SERIAL.setTimeout(100);  // 100 ms should be plenty for 16 bytes @ 9600
   size_t got = RS485_SERIAL.readBytes(rx, sizeof(rx));
 
   // Report
   Serial.printf("LOOPBACK wrote=%u, got=%u\n", (unsigned)wrote, (unsigned)got);
   if (got > 0) {
     // Use your existing dumpHex if present; otherwise inline dump:
-    for (size_t i = 0; i < got; ++i) Serial.printf("%02X%s", rx[i], (i+1<got)?" ":"\n");
+    for (size_t i = 0; i < got; ++i) Serial.printf("%02X%s", rx[i], (i + 1 < got) ? " " : "\n");
   }
   bool pass = (got == sizeof(tx)) && (memcmp(tx, rx, sizeof(tx)) == 0);
   Serial.println(pass ? "LOOPBACK: PASS" : "LOOPBACK: FAIL");
 }
 
-
-bool readDepthSensor(uint16_t &depthRaw) {
-  const uint8_t expected_len = 7;
-  const uint8_t max_retries = 7;
-
-  for (uint8_t attempt = 0; attempt < max_retries; ++attempt) {
-    while (RS485_SERIAL.available()) RS485_SERIAL.read();  // Clear buffer
-
-    digitalWrite(RS485_TX_ENABLE, HIGH);
-    delay(10); // Settling time
-    RS485_SERIAL.write(aTxBuffer4, sizeof(aTxBuffer3));
-    RS485_SERIAL.flush(true);
-    delayMicroseconds(200);
-    digitalWrite(RS485_TX_ENABLE, LOW);
-
-    uint32_t start = millis();
-    while (RS485_SERIAL.available() < expected_len && millis() - start < 200) {
-      delay(1);
+// Wait until the bus is idle for >= 3.5 characters (Modbus RTU pre-silence)
+static bool waitBusIdle(uint32_t baud, uint32_t timeout_ms = 100) {
+  const uint32_t char_us = (uint32_t)(11.0e6 / baud);  // 8N1 ≈ 11 bits/char
+  const uint32_t min_idle_us = 4 * char_us;            // ≥ 3.5 chars
+  uint32_t idle_start = micros();
+  uint32_t t0 = millis();
+  while ((uint32_t)(millis() - t0) < timeout_ms) {
+    if (RS485_SERIAL.available()) {
+      while (RS485_SERIAL.available()) (void)RS485_SERIAL.read();
+      idle_start = micros();
     }
+    if ((uint32_t)(micros() - idle_start) >= min_idle_us) return true;
+    delayMicroseconds(50);
+  }
+  return false;  // bus stayed busy
+}
 
-    if (RS485_SERIAL.available() >= expected_len) {
-      uint8_t response[expected_len];
-      for (int i = 0; i < expected_len; i++) {
-        response[i] = RS485_SERIAL.read();
-      }
-
-      uint16_t crc = modbusCRC(response, expected_len - 2);
-      uint16_t received_crc = response[5] | (response[6] << 8);
-
-      if (crc == received_crc && (response[0] == 0x01 || response[0] == 0x02) && response[1] == 0x03) {
-        depthRaw = ((uint16_t)response[3] << 8) | response[4];
-        Serial.printf("raw depth 16 bit  %u\n", depthRaw);
-        return true;
-      } else {
-        Serial.printf("Bad CRC or header on attempt %u\n", attempt + 1);
-      }
-    } else {
-      Serial.printf("Timeout on attempt %u\n", attempt + 1);
-    }
-
-    delay(50);  // Short retry delay
+// ---- Read depth sensor via raw Modbus RTU (manual DE) ---------------------------
+// Sends: 01 03 00 04 00 01 C5 CB
+// Expects: 01 03 02 HI LO CRC_L CRC_H
+// Returns: (HI<<8)|LO on success, 0xFFFF on failure after retries.
+uint16_t readDepthSensor(unsigned long timeout_ms = 400, uint8_t max_tries = 7) {
+  static bool inited = false;
+  if (!inited) {
+    // UART1 on pins RX=44, TX=43. Start with 9600 8N1.
+    Serial1.begin(9600, SERIAL_8N1, 44, 43);
+    pinMode(RS485_DE, OUTPUT);
+    digitalWrite(RS485_DE, LOW);  // receive by default
+    inited = true;
   }
 
-  Serial.println("Failed to read valid deth sensor rs-485 response after retries");
-  return false;
+  const uint8_t req[8] = { 0x01, 0x03, 0x00, 0x04, 0x00, 0x01, 0xC5, 0xCB };
+
+  for (uint8_t attempt = 1; attempt <= max_tries; ++attempt) {
+    // purge RX
+    while (Serial1.available()) (void)Serial1.read();
+
+    // --- transmit with DE high ---
+    digitalWrite(RS485_DE, HIGH);  // drive bus
+    size_t sent = Serial1.write(req, sizeof(req));
+    Serial1.flush();  // wait for TX FIFO to drain
+    // guard for last stop-bit to clear the line
+    delayMicroseconds(200);       // ~2 char times @ 9600
+    digitalWrite(RS485_DE, LOW);  // back to receive
+
+    if (sent != sizeof(req)) {
+      delay(5);
+      continue;
+    }
+
+    // --- collect until idle gap ---
+    uint8_t rx[64];
+    size_t n = 0;
+    unsigned long t0 = millis(), last_rx = 0;
+    const unsigned idle_gap_ms = 5;
+
+    while ((millis() - t0) < timeout_ms) {
+      while (Serial1.available()) {
+        if (n < sizeof(rx)) rx[n++] = (uint8_t)Serial1.read();
+        last_rx = millis();
+      }
+      if (n && Serial1.available() == 0 && (millis() - last_rx) >= idle_gap_ms) break;
+    }
+
+    if (n < 7) {
+      delay(15);
+      continue;
+    }
+
+    // search tail for the exact 7B frame 01 03 02 HI LO CRC_L CRC_H
+    for (int i = (int)n - 7; i >= 0; --i) {
+      if (rx[i] == 0x01 && rx[i + 1] == 0x03 && rx[i + 2] == 0x02) {
+        uint16_t crc_calc = modbusCRC(&rx[i], 5);
+        uint16_t crc_recv = (uint16_t)rx[i + 5] | ((uint16_t)rx[i + 6] << 8);
+        if (crc_calc == crc_recv) {
+          return ((uint16_t)rx[i + 3] << 8) | rx[i + 4];
+        }
+      }
+    }
+
+    delay(20);
+  }
+
+  return 0xFFFF;
 }
 
 /* read soil sensor by RS-485, check CRC and fill global array 
@@ -435,19 +475,19 @@ bool readDepthSensor(uint16_t &depthRaw) {
 */
 
 static bool readSoilSensor(uint8_t depth, uint8_t header, int& outIdx) {
-    constexpr uint8_t maxRetries = 3;
-    for (uint8_t attempt = 0; attempt < maxRetries; attempt++) {
-        RS485Send(depth);
-        memset(aRx, 0, sizeof(aRx));
-        size_t len = RS485_SERIAL.readBytes(aRx, sizeof(aRx));
-        for (int i = 0; i + 3 < len; i++) {
-            if (aRx[i] == header && aRx[i+1] == 0x03 && aRx[i+2] == 0x04) {
-                outIdx = i;
-                return true;
-            }
-        }
+  constexpr uint8_t maxRetries = 3;
+  for (uint8_t attempt = 0; attempt < maxRetries; attempt++) {
+    RS485Send(depth);
+    memset(aRx, 0, sizeof(aRx));
+    size_t len = RS485_SERIAL.readBytes(aRx, sizeof(aRx));
+    for (int i = 0; i + 3 < len; i++) {
+      if (aRx[i] == header && aRx[i + 1] == 0x03 && aRx[i + 2] == 0x04) {
+        outIdx = i;
+        return true;
+      }
     }
-    return false;
+  }
+  return false;
 }
 
 bool buildModbusRequest(uint8_t slaveAddr, uint16_t regStart, uint16_t regCount, uint8_t (&request)[8]) {
@@ -485,27 +525,27 @@ uint16_t modbusCRC(const uint8_t* data, size_t length) {
 bool appendSensorToPayload(uint8_t addr, uint16_t startReg, uint16_t regCount,
                            uint8_t* payload, size_t* pos, size_t max,
                            uint32_t baud = 9600, uint32_t timeout_ms = 80) {
-    uint8_t rx[64];
-    if (!readModbusFrame(addr, startReg, regCount, rx, sizeof(rx), baud, timeout_ms)) {
-        return false;  // no append on failure
-    }
-    const size_t need = 1 + (size_t)regCount * 2; // addr + data bytes
-    if (*pos + need > max) return false;         // prevent overflow
+  uint8_t rx[64];
+  if (!readModbusFrame(addr, startReg, regCount, rx, sizeof(rx), baud, timeout_ms)) {
+    return false;  // no append on failure
+  }
+  const size_t need = 1 + (size_t)regCount * 2;  // addr + data bytes
+  if (*pos + need > max) return false;           // prevent overflow
 
-    payload[(*pos)++] = addr;                    // tag this chunk with sensor addr
-    memcpy(&payload[*pos], &rx[3], regCount * 2);
-    *pos += regCount * 2;
-    return true;
+  payload[(*pos)++] = addr;  // tag this chunk with sensor addr
+  memcpy(&payload[*pos], &rx[3], regCount * 2);
+  *pos += regCount * 2;
+  return true;
 }
 
 // CHANGED: build a compact LoRaWAN payload for two soil probes
 // Returns number of bytes written to `out`.
 size_t buildLoRaWANPayload(uint8_t* out, size_t max,
                            uint32_t baud = 9600, uint32_t timeout_ms = 80) {
-    size_t pos = 0;
-    (void)appendSensorToPayload(0x01, 0x0001, 2, out, &pos, max, baud, timeout_ms);
-    (void)appendSensorToPayload(0x02, 0x0001, 2, out, &pos, max, baud, timeout_ms);
-    return pos;
+  size_t pos = 0;
+  (void)appendSensorToPayload(0x01, 0x0001, 2, out, &pos, max, baud, timeout_ms);
+  (void)appendSensorToPayload(0x02, 0x0001, 2, out, &pos, max, baud, timeout_ms);
+  return pos;
 }
 
 // CHANGED: debug hex dump helper
@@ -513,4 +553,26 @@ static void dumpHex(const char* tag, const uint8_t* buf, size_t len) {
   Serial.printf("%s (%u):", tag, (unsigned)len);
   for (size_t i = 0; i < len; ++i) Serial.printf(" %02X", buf[i]);
   Serial.println();
+}
+// --- Safe jitter add with floor (ms) ---
+inline uint32_t addJitterClampMin(uint32_t base_ms, int32_t jitter_ms, uint32_t min_ms) {
+  int64_t t = (int64_t)base_ms + (int64_t)jitter_ms;  // signed math, no wrap
+  if (t < (int64_t)min_ms) t = (int64_t)min_ms;       // enforce ≥ min
+  if (t > 0xFFFFFFFFLL) t = 0xFFFFFFFFLL;             // paranoia clamp
+  return (uint32_t)t;
+}
+
+// --- One-shot: save current cycle, set valve-on cycle, schedule next TX (ms) ---
+// Uses globals: TxDutyCycle_hold, appTxDutyCycle, txDutyCycleTime
+// Assumes CYCLE_TIME_VALVE_ON is in milliseconds (same units as appTxDutyCycle).
+void scheduleValveOnCycle(void) {
+
+
+  TxDutyCycle_hold = appTxDutyCycle;     // save current
+  appTxDutyCycle = CYCLE_TIME_VALVE_ON;  // switch to valve-on cycle
+  txDutyCycleTime = addJitterClampMin(
+    appTxDutyCycle,
+    randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND),
+    10u * 60000u  // hard floor: 10 minutes
+  );
 }

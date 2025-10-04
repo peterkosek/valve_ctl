@@ -3,6 +3,8 @@
 #include <Wire.h>
 #include <stdint.h>
 #include <MCP3421.h>
+#include <stddef.h>
+#include "LoRaWan_APP.h"
 
 // GPIO Pin Assignments
 #define PIN_SDA         39   // 
@@ -41,8 +43,8 @@
 #define ADC_ADDR            0x68   // 7-bit address for MCP3421
 #define ADC_CFG_SINGLESHOT  0x90   // 16-bit, single-shot start, PGA=1
 
-#define CYCLE_TIME_VALVE_ON   600000    // 10 min in ms, cycle time with valve on
-
+#define CYCLE_TIME_VALVE_ON   60000    // 10 min in ms, cycle time with valve on
+#define MAX_TX_MS           21600000    //  6 hr max cycle time
 // redirect all calls (works from .ino too)
 #define readModbusFrame(...) readModbusFrame_dbg(__FILE__, __LINE__, __VA_ARGS__)
 
@@ -69,16 +71,19 @@ typedef struct __attribute__((packed)) {
         struct {
             uint8_t onA : 1;  // on/off state
             uint8_t onB : 1;  // on/off state
-            uint8_t onC : 1;  // on/off state
-            uint8_t onD : 1;  // on/off state
+            uint8_t latchA : 1;  // on/off latch state
+            uint8_t latchB : 1;  // on/off latch state
             uint8_t offA    : 1;  // pending shutdown
             uint8_t offB    : 1;  // pending shutdown
-            uint8_t offC    : 1;  // pending shutdown
-            uint8_t offD    : 1;  // pending shutdown
+            uint8_t pendLatchA    : 1;  // pending latch A
+            uint8_t pendLatchB    : 1;  // pending latch B
         };
         uint8_t flags;
     };
 } ValveState_t;
+static_assert(sizeof(ValveState_t) == 2, "ValveState_t must be 2 bytes (time,flags)");
+static_assert(offsetof(ValveState_t, time)  == 0, "time must be at byte 0");
+static_assert(offsetof(ValveState_t, flags) == 1, "flags must be at byte 1");
 
 enum {
   // count up each RTC_DATA_ATTR word…
@@ -163,7 +168,7 @@ void setPowerEnable(uint8_t powerState);
 void RS485Get();
 void RS485Send(uint8_t depth);
 void initRS485(uint16_t baud);
-bool readDepthSensor(uint16_t &depthRaw);
+uint16_t readDepthSensor(unsigned long timeout_ms, uint8_t max_tries);
 bool readFrame(uint8_t depth, uint8_t header, int& outIdx);
 void sendModbusRequest();
 uint16_t modbusCRC(const uint8_t* data, size_t length);
@@ -173,7 +178,8 @@ bool buildModbusRequest(uint8_t slaveAddr, uint16_t regStart, uint16_t regCount,
 //                            uint8_t* outBuf, size_t outMax, uint32_t baud, uint32_t frame_timeout_ms);
 static void dumpHex(const char* tag, const uint8_t* buf, size_t len);
 void rs485_uart_loopback_test(uint32_t baud);
-
+uint32_t addJitterClampMin(uint32_t base_ms, int32_t jitter_ms, uint32_t min_ms);
+void scheduleValveOnCycle(void);
 bool readModbusFrame_dbg(const char* file, int line,
 uint8_t addr, uint16_t startReg, uint16_t regCount,
 uint8_t* outBuf, size_t outMax,
