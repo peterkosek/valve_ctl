@@ -65,6 +65,7 @@ DEPG0290BxS800FxX_BW display(5, 4, 3, 6, 2, 1, -1, 6000000);  // rst,dc,cs,busy,
 Preferences prefs;  // for NVM
 Adafruit_SHT4x sht4 = Adafruit_SHT4x();
 TwoWire *I2C = &Wire;
+Adafruit_MCP3421 adc;
 
 static uint32_t g_last_tx_ms = 0;
 static bool i2c_ok = true;
@@ -127,9 +128,9 @@ RTC_DATA_ATTR uint32_t appTxDutyCycle = 1 * 60 * 1000;
 RTC_DATA_ATTR volatile uint32_t TxDutyCycle_hold;
 RTC_DATA_ATTR volatile uint32_t initialCycleFast;         //  number of time to cycle fast on startup
 RTC_DATA_ATTR volatile uint32_t g_sched_override_ms = 0;  //  pending cycle time changes to apply just before sleep
-RTC_DATA_ATTR uint16_t inv_m_u16 = 500;                   // b-10 stored as Q16.16 (converted once on downlink)
+RTC_DATA_ATTR uint16_t inv_m_u16 = 106;                   // b-10 stored as Q16.16 (converted once on downlink)
 RTC_DATA_ATTR uint16_t lakeRaw = 0;                       //  for display
-RTC_DATA_ATTR int16_t b_x10 = 0;                          // b in 0.1 m units (−200..200 covers −20..20 m)
+RTC_DATA_ATTR int16_t b_x10 = -60;                          // b in 0.1 m units (−200..200 covers −20..20 m)
 
 static const uint32_t TX_CYCLE_FAST_TIME = 60000ul;
 //These are in RTC defined in lorawanapp.cpp
@@ -196,7 +197,9 @@ inline uint32_t read_count32() {
 // --- helper for calibrators---
 inline float depth_m_from_raw(uint16_t raw) {
   if (inv_m_u16 == 0) return 0.0f;  // guard
-  return ((float)raw / (float)inv_m_u16) + ((float)b_x10 / 10.0f);
+  float d = (static_cast<float>(raw) / static_cast<float>(inv_m_u16))
+          + (static_cast<float>(b_x10) * 0.1f);
+  return (d < 0.0f) ? 0.0f : d;     // clamp to zero or above
 }
 
 //  display status draws the screen before sleep, after a delay from uploading to receive any download
@@ -874,6 +877,7 @@ void setup() {
   hardware_pins_init();  //
   setPowerEnable(1);
 
+
   //Serial.printf("LORAWAN_APP_DATA_MAX_SIZE = %u\n", (unsigned)LORAWAN_APP_DATA_MAX_SIZE);
 
   // while(1){
@@ -1047,6 +1051,15 @@ void setup() {
 #endif
 
   Serial.println("BOOT: after HELTEC_B start, Serial ready");
+  if (!adc.begin(ADC_ADDR, &Wire)) {
+    Serial.println("MCP3421 not found on Wire");
+  } else Serial.println("MCP3421 found");
+
+  while (1) {
+    pop_data();
+    display_status();
+    delay(10000);
+  }
 
   // after Mcu.begin(...) and your Serial re-begin
   // rs485_uart_loopback_test(9600);   // one-shot self-test

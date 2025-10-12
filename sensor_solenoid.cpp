@@ -28,8 +28,6 @@ extern uint32_t txDutyCycleTime;
 #define RS485_EN RS485_DE
 constexpr uart_port_t RS485_PORT = UART_NUM_1;  // match Serial1
 
-CMCP3421 adc(0.1692);
-
 uint8_t aTxBuffer0[8] = { 0x01, 0x03, 0x00, 0x01, 0x00, 0x02, 0x95, 0xcb };  // first soil moisture sensor message
 uint8_t aTxBuffer1[8] = { 0x02, 0x03, 0x00, 0x01, 0x00, 0x02, 0x95, 0xf8 };  //  second soil moisture message
 uint8_t aTxBuffer3[8] = { 0x01, 0x03, 0x00, 0x00, 0x00, 0x0a, 0xc5, 0xcd };  //  for three metal proble soil moisture sensor

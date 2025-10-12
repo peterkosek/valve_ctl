@@ -2,7 +2,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <stdint.h>
-#include <MCP3421.h>
+#include <Adafruit_MCP3421.h>
 #include <stddef.h>
 #include "LoRaWan_APP.h"
 
