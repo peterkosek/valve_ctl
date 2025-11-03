@@ -39,14 +39,27 @@
 #define TICKS_PER_MIN   28800u      //  based on   I_DELAY(08FFF), 480 Hz   //  integer math please
 #define VOLUME_PER_TICK 100u         //  whatever the volume per tick of the meter is displayed as gpm
 
+// for the lake depth rs 485 gague
+//rs485 cal in mm from raw data is 1/m = 50552, b = -679.6
+#define LAKE_ZERO_OFFSET   1000000000       //  gage results 1 billion at the surface
+#define COUNTS_PER_METER   50552      //  calibrated
+
 // ADC (MCP3421) Settings
 #define ADC_ADDR            0x68   // 7-bit address for MCP3421
 #define ADC_CFG_SINGLESHOT  0x90   // 16-bit, single-shot start, PGA=1
 
-#define CYCLE_TIME_VALVE_ON   60000    // 10 min in ms, cycle time with valve on
+#define CYCLE_TIME_VALVE_ON   600000    // 10 min in ms, cycle time with valve on
 #define MAX_TX_MS           21600000    //  6 hr max cycle time
 // redirect all calls (works from .ino too)
 #define readModbusFrame(...) readModbusFrame_dbg(__FILE__, __LINE__, __VA_ARGS__)
+
+// for the commands downloaded
+#define START_TIMED_A  (1u<<0)
+#define START_TIMED_B  (1u<<1)
+#define LATCH_A        (1u<<2)
+#define LATCH_B        (1u<<3)
+#define OFF_A          (1u<<4)
+#define OFF_B          (1u<<5)
 
 // typedef struct __attribute__((packed)) {
 
@@ -66,7 +79,8 @@
 // } ValvePacket_t;
 
 typedef struct __attribute__((packed)) {
-    uint8_t time;       // 10-minute countdown
+    uint8_t timeA;       // 10-minute countdown
+    uint8_t timeB;       // 10-minute countdown
     union {
         struct {
             uint8_t onA : 1;  // on/off state
@@ -81,9 +95,18 @@ typedef struct __attribute__((packed)) {
         uint8_t flags;
     };
 } ValveState_t;
-static_assert(sizeof(ValveState_t) == 2, "ValveState_t must be 2 bytes (time,flags)");
-static_assert(offsetof(ValveState_t, time)  == 0, "time must be at byte 0");
-static_assert(offsetof(ValveState_t, flags) == 1, "flags must be at byte 1");
+
+// One downlink command: bits = intent, units = 10-min ticks for A/B
+typedef struct __attribute__((packed)) {
+    uint8_t flags;    // bit0 startTimedA, bit1 startTimedB, bit2 pendLatchA, bit3 pendLatchB, bit4 offA, bit5 offB
+    uint8_t unitsA;   // used iff startTimedA set
+    uint8_t unitsB;   // used iff startTimedB set
+} ValveCmd_t;
+
+
+static_assert(sizeof(ValveState_t) == 3, "ValveState_t must be 3 bytes (time,time,flags)");
+static_assert(offsetof(ValveState_t, timeA)  == 0, "timeA must be at byte 0");
+static_assert(offsetof(ValveState_t, timeB)  == 1, "timeB must be at byte 1");
 
 enum {
   // count up each RTC_DATA_ATTR word…
@@ -132,7 +155,7 @@ enum {
   ULP_INC_LABEL        = 14,
   ULP_SET_TICK_POP,
   ULP_NO_TIMER_WRAP,
-  ULP_SKIP_MERGE, 
+  ULP_SKIP_MERGE,  
   ULP_CPU_IS_AWAKE, 
   ULP_BUMP_HI,
   UL_BUMP_PEND_HI,
@@ -152,10 +175,18 @@ extern uint8_t aTxBuffer0[8];     // first soil moisture sensor message
 extern uint8_t aTxBuffer1[8];     // second soil moisture sensor message
 extern uint8_t sTempC[4];         // temperature data from soil probes
 extern uint8_t sMoist[4];         // moisture data from soil probes
-extern uint8_t wPres[2];         // raw pressure from adc, needs calibration and conversion
-extern uint8_t reedCount[2];  // reed pulses counted, MSB, LSB
+extern uint8_t wPres[2];          // raw pressure from adc, needs calibration and conversion
+extern uint8_t reedCount[2];      // reed pulses counted, MSB, LSB
 extern uint8_t reedcyclesTenMin[2]; // intra reed pulse converted to frequency in activations in 10 min, MSB, LSB
-extern uint8_t soilSensorOut[6];  //  for the two soil sensors including moisture, temp and pH
+extern uint8_t soilSensorOut[6];    //  for the two soil sensors including moisture, temp and pH
+extern volatile uint32_t lakeDepth32Raw;        //  used for rs485 lake depth
+extern RTC_DATA_ATTR uint16_t lakeRaw;          //  the depth of the gague based on sensor readings
+extern RTC_DATA_ATTR uint16_t g_lake_depth_mm;  //  (depth of the sensor compared to full) to get the level below full.  
+extern RTC_DATA_ATTR volatile bool g_need_display; 
+extern RTC_DATA_ATTR int16_t lake_level_mm;     //  calculated from the sensor depth and the depth of the sensor based on the reading.  This is what is saved.  
+extern RTC_DATA_ATTR uint32_t inv_m_u32;                    // b-10 stored as Q16.16 (converted once on downlink), no sleve: 98 selve tranduced: 175                 //  for display
+extern RTC_DATA_ATTR int32_t b_x10;   
+extern RTC_DATA_ATTR uint16_t sensorMeasuredDepth;
 
 // Function prototypes
 void hardware_pins_init();
@@ -168,7 +199,7 @@ void setPowerEnable(uint8_t powerState);
 void RS485Get();
 void RS485Send(uint8_t depth);
 void initRS485(uint16_t baud);
-uint16_t readDepthSensor(unsigned long timeout_ms, uint8_t max_tries);
+bool readDepthSensor(unsigned long timeout_ms, uint8_t max_tries);
 bool readFrame(uint8_t depth, uint8_t header, int& outIdx);
 void sendModbusRequest();
 uint16_t modbusCRC(const uint8_t* data, size_t length);

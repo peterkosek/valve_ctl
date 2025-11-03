@@ -56,7 +56,8 @@ void hardware_pins_init(void) {
   pinMode(RS485_DE, OUTPUT);
   digitalWrite(RS485_DE, LOW);  // listen
   pinMode(ADC_CTL_PIN, OUTPUT);
-
+  pinMode(PIN_SDA, INPUT_PULLUP);
+  pinMode(PIN_SCL, INPUT_PULLUP);
   pinMode(VBAT_READ_PIN, INPUT);                      // not needed
   analogSetPinAttenuation(VBAT_READ_PIN, ADC_2_5db);  //  6db reduces voltage to 1/2 of input
 
@@ -152,8 +153,8 @@ uint16_t readMCP3421avg_cont() {
 
         // RDY==0 → data valid
         if ((stat & 0x80) == 0) {
-          int16_t raw = (int16_t)((uint16_t)msb << 8 | lsb);
-          sum += raw;
+          int16_t raw = (int16_t)((uint16_t)msb << 8 | lsb);  // sign-correct
+          sum  += raw;
           ok++;
           break;  // next sample
         }
@@ -177,8 +178,9 @@ uint16_t readMCP3421avg_cont() {
 
   if (ok) {
     fail_streak = 0;
-    last_good = (uint16_t)(sum / (int32_t)ok);  // average of valid samples only
-    return last_good;
+    last_good = (int16_t)(sum / (int32_t)ok);  // average of valid samples only
+    uint16_t raw_u = (int16_t(last_good < 0)) ? 0 : (uint16_t)last_good;
+    return raw_u;
   }
 
   // No valid samples — try a soft bus reset occasionally, then return last value
@@ -188,7 +190,7 @@ uint16_t readMCP3421avg_cont() {
     Wire.begin(PIN_SDA, PIN_SCL);  // assumes you’ve called Wire.begin(...) in setup()
     fail_streak = 0;
   }
-  return last_good;  // graceful fallback instead of wedging
+  return uint16_t(last_good);  // graceful fallback instead of wedging
 }
 
 // Assume PIN_EN_SENSE_PWR was pinMode’d to OUTPUT in setup()
@@ -396,21 +398,42 @@ static bool waitBusIdle(uint32_t baud, uint32_t timeout_ms = 100) {
   return false;  // bus stayed busy
 }
 
+inline uint16_t lake_depth_mm_from_raw(int32_t raw) {
+  if (inv_m_u32 == 0) return 0;  // guard
+  // wide, signed math; avoid overflow on *100
+  int64_t num = static_cast<int64_t>(raw);
+  int64_t scale = static_cast<int64_t>(inv_m_u32);
+  int64_t bx10 = static_cast<int64_t>(b_x10);
+
+  // depth_m = raw / inv_m_u32 + b_x10/10
+  // return depth_m * 100 as uint16_t with clamp 0..65535
+  int64_t depth = (num) / scale + (bx10/10);  // (b_x10/10)*100 = b_x10*10
+  if (depth < 0) depth = 0;
+  if (depth > 65535) depth = 65535;
+  return static_cast<uint16_t>(depth);
+}
+
 // ---- Read depth sensor via raw Modbus RTU (manual DE) ---------------------------
 // Sends: 01 03 00 04 00 01 C5 CB
 // Expects: 01 03 02 HI LO CRC_L CRC_H
 // Returns: (HI<<8)|LO on success, 0xFFFF on failure after retries.
-uint16_t readDepthSensor(unsigned long timeout_ms = 400, uint8_t max_tries = 7) {
+bool readDepthSensor(unsigned long timeout_ms = 200, uint8_t max_tries = 7) {
   static bool inited = false;
   if (!inited) {
-    // UART1 on pins RX=44, TX=43. Start with 9600 8N1.
+    // UART1 on pins RX=44, TX=43. 9600 8N1 (no parity) — as we found works.
     Serial1.begin(9600, SERIAL_8N1, 44, 43);
     pinMode(RS485_DE, OUTPUT);
     digitalWrite(RS485_DE, LOW);  // receive by default
     inited = true;
   }
 
-  const uint8_t req[8] = { 0x01, 0x03, 0x00, 0x04, 0x00, 0x01, 0xC5, 0xCB };
+  // Build request: [01][03][00 07][00 02][CRC_L][CRC_H]
+  uint8_t req[8] = { 0x01, 0x03, 0x00, 0x07, 0x00, 0x02, 0x00, 0x00 };
+  {
+    uint16_t crc = modbusCRC(req, 6);
+    req[6] = (uint8_t)(crc & 0xFF);
+    req[7] = (uint8_t)(crc >> 8);
+  }
 
   for (uint8_t attempt = 1; attempt <= max_tries; ++attempt) {
     // purge RX
@@ -419,15 +442,11 @@ uint16_t readDepthSensor(unsigned long timeout_ms = 400, uint8_t max_tries = 7) 
     // --- transmit with DE high ---
     digitalWrite(RS485_DE, HIGH);  // drive bus
     size_t sent = Serial1.write(req, sizeof(req));
-    Serial1.flush();  // wait for TX FIFO to drain
-    // guard for last stop-bit to clear the line
-    delayMicroseconds(200);       // ~2 char times @ 9600
-    digitalWrite(RS485_DE, LOW);  // back to receive
+    Serial1.flush();               // wait for TX FIFO to drain
+    delayMicroseconds(300);        // ~3.5 char times @ 9600
+    digitalWrite(RS485_DE, LOW);   // back to receive
 
-    if (sent != sizeof(req)) {
-      delay(5);
-      continue;
-    }
+    if (sent != sizeof(req)) { delay(5); continue; }
 
     // --- collect until idle gap ---
     uint8_t rx[64];
@@ -443,28 +462,41 @@ uint16_t readDepthSensor(unsigned long timeout_ms = 400, uint8_t max_tries = 7) 
       if (n && Serial1.available() == 0 && (millis() - last_rx) >= idle_gap_ms) break;
     }
 
-    if (n < 7) {
-      delay(15);
-      continue;
-    }
+    // Need at least 9 bytes: 01 03 04 [HI7 LO7 HI8 LO8] CRC_L CRC_H
+    if (n < 9) { delay(15); continue; }
 
-    // search tail for the exact 7B frame 01 03 02 HI LO CRC_L CRC_H
-    for (int i = (int)n - 7; i >= 0; --i) {
-      if (rx[i] == 0x01 && rx[i + 1] == 0x03 && rx[i + 2] == 0x02) {
-        uint16_t crc_calc = modbusCRC(&rx[i], 5);
-        uint16_t crc_recv = (uint16_t)rx[i + 5] | ((uint16_t)rx[i + 6] << 8);
-        if (crc_calc == crc_recv) {
-          return ((uint16_t)rx[i + 3] << 8) | rx[i + 4];
-        }
+    // Scan for a valid frame tail-first (handles line noise / concatenation)
+    for (int i = (int)n - 9; i >= 0; --i) {
+      if (rx[i+0] == 0x01 && rx[i+1] == 0x03 && rx[i+2] == 0x04) {
+        // CRC over first 7 bytes
+        uint16_t crc_calc = modbusCRC(&rx[i], 7);
+        uint16_t crc_recv = (uint16_t)rx[i + 7] | ((uint16_t)rx[i + 8] << 8);
+        if (crc_calc != crc_recv) continue;
+
+        // Two 16-bit registers (big-endian within each register)
+        uint16_t r7 = ((uint16_t)rx[i + 3] << 8) | rx[i + 4];
+        uint16_t r8 = ((uint16_t)rx[i + 5] << 8) | rx[i + 6];
+
+        // Combine into uint32_t (Modbus default word order: reg7=high word, reg8=low word)
+        uint32_t v = ((uint32_t)r7 << 16) | (uint32_t)r8;
+        Serial.printf("raw data for lake:  %u \n", v);
+        lakeDepth32Raw = (v < 1000000000) ? 0 : (v - 1000000000);
+        sensorMeasuredDepth = lake_depth_mm_from_raw(lakeDepth32Raw);    //  
+        lake_level_mm = (int)sensorMeasuredDepth - (int)g_lake_depth_mm;
+        Serial.printf("sensorMeasuredDepth:  %u \n", sensorMeasuredDepth);
+        Serial.printf("lakeLevel:  %i \n", lake_level_mm);
+        Serial.printf("g_lake_depth_mm:  %i \n", g_lake_depth_mm);
+        g_need_display = true;
+        return true;
       }
     }
 
     delay(20);
   }
 
-  return 0xFFFF;
+  // Leave previous lakeDepth32Raw untouched on failure; signal false
+  return false;
 }
-
 /* read soil sensor by RS-485, check CRC and fill global array 
     soilSensorOut with data
     call ith the number of  sensors in the node, but will work if one call with 2 has only one node

@@ -5,130 +5,95 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 
-extern volatile ValveState_t *valveA, *valveB;
-extern volatile ValveState_t vlv_packet_pend;
-extern uint32_t appTxDutyCycle, TxDutyCycle_hold, txDutyCycleTime;
 static portMUX_TYPE g_vlvMux = portMUX_INITIALIZER_UNLOCKED;
 #define ENTER_CRIT() portENTER_CRITICAL(&g_vlvMux)
 #define EXIT_CRIT() portEXIT_CRITICAL(&g_vlvMux)
 // move your current set_vlv_status(), printValveState(), displayPacketBits() here unchanged
 
-/* process the valve state:  Check for valve off commands first, then if on command set the TxDutyCycle
- * and turn on the valve, set the timer as cycles based on new TxDutyCycle */
-void set_vlv_status() {
-  ValveState_t s;  // local snapshot
-  uint32_t seq_before, seq_after;
-
-  portENTER_CRITICAL(&g_vlvMux);
-  // snapshot without invoking operator= on a volatile source
-  memcpy(&s, (const void *)&vlv_packet_pend, sizeof(s));
-  // consume one-shot bits while still atomic
-  vlv_packet_pend.onA = 0;
-  vlv_packet_pend.onB = 0;
-  vlv_packet_pend.offA = 0;
-  vlv_packet_pend.offB = 0;
-  vlv_packet_pend.pendLatchA = 0;
-  vlv_packet_pend.pendLatchB = 0;
-  vlv_packet_pend.flags = 0;
-  portEXIT_CRITICAL(&g_vlvMux);
-
-  // now use ONLY 's' below (no further reads of vlv_packet_pend)
-  bool needTimedSchedule = false, didPlainOff = false, latchChange = false;
-
-  if (s.pendLatchA) {
-    const bool latch_on = (s.latchA != 0);
-    controlValve(0, latch_on ? 1 : 0);
-    valveA->latchA = latch_on ? 1 : 0;
-    valveA->onA = 0;
-    valveA->time = 0;
-    latchChange = true;
-  } else if (s.onA) {
-    controlValve(0, 1);
-    valveA->onA = 1;
-    valveA->time = s.time;
-    needTimedSchedule = true;
-  } else if (s.offA) {
-    controlValve(0, 0);
-    valveA->onA = 0;
-    valveA->time = 0;
-    valveA->latchA = 0;
-    didPlainOff = true;
-  }
-  if (!s.onA && s.time && valveA->onA) {
-    valveA->time = s.time;
-    needTimedSchedule = true;
-  }
-
-
-  if (s.pendLatchB) {
-    const bool latch_on = (s.latchB != 0);
-    controlValve(1, latch_on ? 1 : 0);
-    valveB->latchB = latch_on ? 1 : 0;
-    valveB->onB = 0;
-    valveB->time = 0;
-    latchChange = true;
-  } else if (s.onB) {
-    controlValve(1, 1);
-    valveB->onB = 1;
-    valveB->time = s.time;
-    needTimedSchedule = true;
-  } else if (s.offB) {
-    controlValve(1, 0);
-    valveB->onB = 0;
-    valveB->time = 0;
-    valveB->latchB = 0;
-    didPlainOff = true;
-  }
-
-  if (needTimedSchedule) {
-    scheduleValveOnCycle();
-    LoRaWAN.cycle(txDutyCycleTime);
-  } else if (didPlainOff && !latchChange) {
-    const bool all_idle = (!valveA->onA && !valveB->onB && !valveA->latchA && !valveB->latchB);
-    if (all_idle) {
-      appTxDutyCycle = TxDutyCycle_hold;
-      LoRaWAN.cycle(appTxDutyCycle);
-    }
-  }
-  if (!s.onB && s.time && valveB->onB) {
-    valveB->time = s.time;
-    needTimedSchedule = true;
-  }
-  Serial.printf("flags 0x%02X, time %u\n", s.flags, s.time);
+// Take a one-shot snapshot and CLEAR it so it won't re-fire next tick
+void snapshot_cmd(volatile ValveCmd_t* out) {
+  uint8_t f, a, b;
+  noInterrupts();
+  f = g_cmd.flags;  a = g_cmd.unitsA;  b = g_cmd.unitsB;
+  g_cmd.flags = 0;  g_cmd.unitsA = 0;  g_cmd.unitsB = 0;   // clear one-shot
+  interrupts();
+  out->flags  = f;
+  out->unitsA = a;
+  out->unitsB = b;
 }
 
-void printValveState(const ValveState_t &p) {
-  Serial.printf("time=%u (x10min), flags=0x%02X  |  onA=%u onB=%u  latchA=%u latchB=%u  offA=%u offB=%u  pendLatchA=%u pendLatchB=%u\n",
-                p.time, p.flags,
-                p.onA, p.onB, p.latchA, p.latchB, p.offA, p.offB, p.pendLatchA, p.pendLatchB);
+// Bit masks for readability
+enum { startTimedA=1<<0, startTimedB=1<<1, pendLatchA=1<<2, pendLatchB=1<<3, offA=1<<4, offB=1<<5 };
+
+void apply_downlink_snapshot(void) {
+    uint8_t f, uA, uB;
+    noInterrupts();
+    f  = dl_flags;   uA = dl_unitsA;   uB = dl_unitsB;
+    dl_flags = dl_unitsA = dl_unitsB = 0;  // consume (one-shot)
+    interrupts();
+
+    // OFF overrides
+    if (f & OFF_A) { controlValve(0,0); valveState->onA=0; valveState->latchA=0; valveState->timeA=0; set_cycle_for_irrigation(0);g_need_display = true;}
+    if (f & OFF_B) { controlValve(1,0); valveState->onB=0; valveState->latchB=0; valveState->timeB=0; set_cycle_for_irrigation(0);g_need_display = true;}
+
+    // LATCH (force ON, no timer)
+    if (f & LATCH_A) { controlValve(0,1); valveState->onA=0; valveState->latchA=1; valveState->timeA=0; }
+    if (f & LATCH_B) { controlValve(1,1); valveState->onB=0; valveState->latchB=1; valveState->timeB=0; }
+
+    // TIMED (force ON, clear latch, set ticks from units)
+    if (f & START_TIMED_A) { controlValve(0,1); valveState->onA=1; valveState->latchA=0; valveState->timeA=uA; set_cycle_for_irrigation(1);}
+    if (f & START_TIMED_B) { controlValve(1,1); valveState->onB=1; valveState->latchB=0; valveState->timeB=uB; set_cycle_for_irrigation(1);}
 }
 
-// AFTER (CHANGE #1)
-void displayPacketBits(const ValveState_t &pkt) {
-  // On-wire: [time][flags] -> low 8 = time, high 8 = flags
-  const uint16_t v = ((uint16_t)pkt.flags << 8) | (uint16_t)pkt.time;
+//  true: set to CYCLE_TIME_VALVE_ON when timed valves are turned on unless it is already set
+//  false: return to previously saved cycle time only if both valves are off
+//  only if both valves are off
+void set_cycle_for_irrigation(bool set_it){
+  if (set_it && (appTxDutyCycle != CYCLE_TIME_VALVE_ON)){
+    TxDutyCycle_hold = appTxDutyCycle;
+    appTxDutyCycle = CYCLE_TIME_VALVE_ON;
+    LoRaWAN.cycle(appTxDutyCycle);
+  } else if (valveState->onA==0 && valveState->onB==0) {
+    appTxDutyCycle = TxDutyCycle_hold;
+    LoRaWAN.cycle(appTxDutyCycle);
+  }
+}
+//  display status draws the screen before sleep, after a delay from uploading to receive any download
+void show_vlv_status(uint8_t vlv) {
+  switch (vlv) {
+    case 0:
+      if (valveState->onA) {
+        unsigned mins = (unsigned)((valveState->timeA * 10));  //   as the time has already been decremented
+        snprintf(buffer, sizeof(buffer), "A %u min\n", mins);
+      } else if (valveState->latchA) {
+        snprintf(buffer, sizeof(buffer), "A latched\n");
+      } else {
+        snprintf(buffer, sizeof(buffer), "A off");
+      }
 
-  // Take an atomic snapshot of the live state for display
-  ValveState_t a, b, pend;
-  ENTER_CRIT();
-  memcpy(&a, (const void *)valveA, sizeof(a));
-  memcpy(&b, (const void *)valveB, sizeof(b));
-  memcpy(&pend, (const void *)&vlv_packet_pend, sizeof(pend));
-  EXIT_CRIT();
-
-  displayBits16(v, a, b, pend);
+      break;
+    case 1:
+      if (valveState->onB) {
+        unsigned mins = (unsigned)((valveState->timeB * 10));
+        snprintf(buffer, sizeof(buffer), "B %u min\n", mins);
+      } else if (valveState->latchB) {
+        snprintf(buffer, sizeof(buffer), "B latched\n");
+      } else {
+        snprintf(buffer, sizeof(buffer), "B off");
+      }
+      break;
+  }
 }
 
-void displayBits16(uint16_t v,
-                   const ValveState_t &a,
-                   const ValveState_t &b,
-                   const ValveState_t &pend) {
-  for (int i = 15; i >= 0; --i) Serial.print((v >> i) & 1);
+// run every tick (e.g., 10-min), AFTER apply_downlink and any UI button handling
+void tick_timers(volatile ValveState_t *v){
+    if (v->onA && !v->latchA && !g_skip_next_decrement && v->timeA) { v->timeA--;}
+    if (v->onB && !v->latchB && !g_skip_next_decrement && v->timeB) { v->timeB--;}
 
-  // Show the *live* state snapshot (not the cleared globals)
-  Serial.printf("\nvalve A time %u status %u off %u\n", (unsigned)a.time, (unsigned)a.onA, (unsigned)a.offA);
-  Serial.printf("valve B time %u status %u off %u\n", (unsigned)b.time, (unsigned)b.onB, (unsigned)b.offB);
-  Serial.printf("last pend   t=%u on %u:%u off %u:%u\n",
-                (unsigned)pend.time, (unsigned)pend.onA, (unsigned)pend.onB,
-                (unsigned)pend.offA, (unsigned)pend.offB);
+    if (v->onA && !v->latchA && v->timeA == 0) { controlValve(0,0); v->onA=0; set_cycle_for_irrigation(0);g_need_display = true;}  // end timed A
+    if (v->onB && !v->latchB && v->timeB == 0) { controlValve(1,0); v->onB=0; set_cycle_for_irrigation(0);g_need_display = true;}  // end timed B
+
+    g_skip_next_decrement = true;  //  only once per wake cycle
 }
+
+
