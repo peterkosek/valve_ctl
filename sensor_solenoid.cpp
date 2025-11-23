@@ -407,7 +407,7 @@ inline uint16_t lake_depth_mm_from_raw(int32_t raw) {
 
   // depth_m = raw / inv_m_u32 + b_x10/10
   // return depth_m * 100 as uint16_t with clamp 0..65535
-  int64_t depth = (num) / scale + (bx10/10);  // (b_x10/10)*100 = b_x10*10
+  int64_t depth = ((num) * 100)/ scale + (bx10*10);  // (b_x10/10)*100 = b_x10*10
   if (depth < 0) depth = 0;
   if (depth > 65535) depth = 65535;
   return static_cast<uint16_t>(depth);
@@ -428,7 +428,9 @@ bool readDepthSensor(unsigned long timeout_ms = 200, uint8_t max_tries = 7) {
   }
 
   // Build request: [01][03][00 07][00 02][CRC_L][CRC_H]
-  uint8_t req[8] = { 0x01, 0x03, 0x00, 0x07, 0x00, 0x02, 0x00, 0x00 };
+  //uint8_t req[8] = { 0x01, 0x03, 0x00, 0x07, 0x00, 0x02, 0x00, 0x00 };
+       uint8_t req[8] = { 0x01, 0x03, 0x00, 0x04, 0x00, 0x01 };    //  for the second 2 metor sensor, returns in cm
+
   {
     uint16_t crc = modbusCRC(req, 6);
     req[6] = (uint8_t)(crc & 0xFF);
@@ -463,30 +465,32 @@ bool readDepthSensor(unsigned long timeout_ms = 200, uint8_t max_tries = 7) {
     }
 
     // Need at least 9 bytes: 01 03 04 [HI7 LO7 HI8 LO8] CRC_L CRC_H
-    if (n < 9) { delay(15); continue; }
+    // for lake 2 need two bytes, data is in cm, no calibrator  01 03 02 HI LO CRC_L CRC_H
+    if (n < 7) { delay(15); continue; }
 
     // Scan for a valid frame tail-first (handles line noise / concatenation)
-    for (int i = (int)n - 9; i >= 0; --i) {
-      if (rx[i+0] == 0x01 && rx[i+1] == 0x03 && rx[i+2] == 0x04) {
+    for (int i = (int)n - 7; i >= 0; --i) {
+      if (rx[i+0] == 0x01 && rx[i+1] == 0x03 && rx[i+2] == 0x02) {
         // CRC over first 7 bytes
-        uint16_t crc_calc = modbusCRC(&rx[i], 7);
-        uint16_t crc_recv = (uint16_t)rx[i + 7] | ((uint16_t)rx[i + 8] << 8);
+        uint16_t crc_calc = modbusCRC(&rx[i], 5);
+        uint16_t crc_recv = (uint16_t)rx[i + 5] | ((uint16_t)rx[i + 6] << 8);
         if (crc_calc != crc_recv) continue;
 
         // Two 16-bit registers (big-endian within each register)
+        // only one 16 bit reg for the lake 2 sensor
         uint16_t r7 = ((uint16_t)rx[i + 3] << 8) | rx[i + 4];
-        uint16_t r8 = ((uint16_t)rx[i + 5] << 8) | rx[i + 6];
+        //  uint16_t r8 = ((uint16_t)rx[i + 5] << 8) | rx[i + 6];
 
         // Combine into uint32_t (Modbus default word order: reg7=high word, reg8=low word)
-        uint32_t v = ((uint32_t)r7 << 16) | (uint32_t)r8;
-        Serial.printf("raw data for lake:  %u \n", v);
-        lakeDepth32Raw = (v < 1000000000) ? 0 : (v - 1000000000);
-        sensorMeasuredDepth = lake_depth_mm_from_raw(lakeDepth32Raw);    //  
-        lake_level_mm = (int)sensorMeasuredDepth - (int)g_lake_depth_mm;
-        Serial.printf("sensorMeasuredDepth:  %u \n", sensorMeasuredDepth);
-        Serial.printf("lakeLevel:  %i \n", lake_level_mm);
+        // uint32_t v = ((uint32_t)r7 << 16) | (uint32_t)r8;
+        Serial.printf("raw data for lake:  %u \n", r7);
+        //lakeDepth32Raw = (v < 1000000000) ? 0 : (v - 1000000000);
+        //sensorMeasuredDepth = lake_depth_mm_from_raw(lakeDepth32Raw);    //  
+        lake_level_mm = (int)r7 - (int)g_lake_depth_mm;
+        Serial.printf("sensorMeasuredDepth cm:  %u \n", r7/10);
+        Serial.printf("lakeLevel:  %f meters\n", (float)lake_level_mm/1000);
         Serial.printf("g_lake_depth_mm:  %i \n", g_lake_depth_mm);
-        g_need_display = true;
+
         return true;
       }
     }

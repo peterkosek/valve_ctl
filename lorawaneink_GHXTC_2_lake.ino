@@ -21,9 +21,10 @@
 
 #include <Arduino.h>
 #include "LoRaWan_APP.h"
+//#include "LoRaMac.h"
 //#include "LoRaMacCommands.h"
 #include "Wire.h"
-//#include "GXHTC.h"
+#include "GXHTC.h"
 #include "HT_DEPG0290BxS800FxX_BW.h"
 #include "sensor_solenoid.h"
 #include "esp_sleep.h"
@@ -41,10 +42,16 @@
 #include "esp_heap_caps.h"
 #include "valve_logic.h"
 #include <string.h>
-
+#include <inttypes.h>
+#include "freertos/semphr.h"
 
 // 2) A handy macro to get a pointer to any struct at a given word-index:
 // makes rtc vars volatile
+
+#ifndef RTC_CNTL_MAIN_STATE_IN_IDLE_S  //  this constant is not longer available in the header
+#define RTC_CNTL_MAIN_STATE_IN_IDLE_S 27u
+#endif
+
 #define RTC_SLOW_BYTE_MEM ((uint8_t *)SOC_RTC_DATA_LOW)
 #define RTC_SLOW_MEMORY ((volatile uint32_t *)SOC_RTC_DATA_LOW)
 #define RTC_SLOW_STRUCT_PTR(type, idx) \
@@ -57,6 +64,7 @@ constexpr const char *K_WAKE_TH = "wake_th";
 constexpr const char *K_NAME = "screenMsg";
 constexpr const char *K_INV_M = "inv_m_u32";
 constexpr const char *K_BX10 = "b_x10";
+static SemaphoreHandle_t g_uiSem;
 
 //  pointers in the ULP space defined in sensorSolenpoid.h
 volatile ValveState_t *valveState = RTC_SLOW_STRUCT_PTR(ValveState_t, ULP_VALVE_A);
@@ -67,7 +75,7 @@ static const uint32_t STATUS_UPLINK_DELAY_MS = 3000;  // ~3 s after RX2
 RTC_DATA_ATTR char g_name[13] = "no name";  // screen display name
 RTC_DATA_ATTR uint32_t epd_hygiene = 0;     //    to reset the screen ever 50 wakes
 
-DEPG0290BxS800FxX_BW display(5, 4, 3, 6, 2, 1, -1, 6000000);  // rst,dc,cs,busy,sck,mosi,miso,frequency
+DEPG0290BxS800FxX_BW myDisplay(5, 4, 3, 6, 2, 1, -1, 6000000);  // rst,dc,cs,busy,sck,mosi,miso,frequency
 //GXHTC gxhtc;
 Preferences prefs;  // for NVM
 Adafruit_SHT4x sht4 = Adafruit_SHT4x();
@@ -81,13 +89,24 @@ static uint8_t i2c_fail_streak = 0;
 static uint32_t i2c_quiet_until_ms = 0;
 static bool i2c_ready = 0;
 static bool join_inflight = false;
+static bool send_inflight = false;
+static uint32_t g_allow_ui_ms = 0;  // when it's safe to touch display
 static uint32_t join_retry_at_ms = 0;
+
 RTC_DATA_ATTR uint16_t pressResult = 0;  //  used for adc result as global, lake depth and line pressure
 bool g_skip_next_decrement = false;
 // for display
-volatile bool g_need_display = false;
-volatile ValveCmd_t g_cmd;  // written by RX/ISR or LoRa callback
+volatile bool g_need_display = 0;  // 0 = nothing to do; >0 = do UI once
+volatile ValveCmd_t g_cmd;         // written by RX/ISR or LoRa callback
 volatile uint8_t dl_flags, dl_unitsA, dl_unitsB;
+
+static inline bool rx_windows_clear() {
+  return (g_last_tx_ms == 0) || ((int32_t)(millis() - (g_last_tx_ms + 2000)) >= 0);
+}
+
+static inline const char *rxw(bool rx2) {
+  return rx2 ? "RX2" : "RX1";
+}
 
 // [GPT] helper: wait for E-Ink BUSY to go idle without blocking the whole system
 bool eink_wait_idle(uint32_t timeout_ms) {
@@ -95,8 +114,7 @@ bool eink_wait_idle(uint32_t timeout_ms) {
   const bool BUSY_ACTIVE = HIGH;  // DEPG0290 panels pull BUSY high while refreshing
   uint32_t deadline = millis() + timeout_ms;
   while (digitalRead(EPD_BUSY_PIN) == BUSY_ACTIVE) {
-    delay(500);  // yield to other tasks (LoRa, etc.)
-
+    delay(250);                                             // yield to other tasks (LoRa, etc.)
     if ((int32_t)(millis() - deadline) >= 0) return false;  // timed out
   }
   return true;
@@ -118,12 +136,12 @@ volatile ValveState_t vlv_packet_pend;  // used to keep the command and the stat
 //#define VALVE_NODE true  //  two valve controlller and possible line pressure
 //#define SOIL_SENSOR_NODE true  //  two soil temp moist and possible pH
 #define LAKE_NODE true  //  one 16 bit number reflecting lake depth, calibration constants in device table
-
+//#define CALIBRATE_DEPTH true  //  for depth calibration to serial monitor only, not for deploy
 
 /* OTAA para*/
-uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x06, 0x53, 0xf3 };
+uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x06, 0x53, 0x00 };
 uint8_t appEui[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-uint8_t appKey[] = { 0x74, 0xD6, 0x6E, 0x63, 0x45, 0x82, 0x48, 0x27, 0xFE, 0xC5, 0xB7, 0x70, 0xBA, 0x2B, 0x50, 0x4A };
+uint8_t appKey[] = { 0x74, 0xD6, 0x6E, 0x63, 0x45, 0x82, 0x48, 0x27, 0xFE, 0xC5, 0xB7, 0x70, 0xBA, 0x2B, 0x50, 0x56 };
 
 /* ABP para --  not used for this project*/
 uint8_t nwkSKey[] = { 0x15, 0xb1, 0xd0, 0xef, 0xa4, 0x63, 0xdf, 0xbe, 0x3d, 0x11, 0x18, 0x1e, 0x1e, 0xc7, 0xda, 0x85 };
@@ -141,9 +159,10 @@ DeviceClass_t loraWanClass = CLASS_A;
 
 /*the application data transmission duty cycle.  value in [ms].*/
 
-RTC_DATA_ATTR uint32_t appTxDutyCycle = 30 * 1000;
+RTC_DATA_ATTR uint32_t appTxDutyCycle = 60 * 60 * 1 * 1000;
 RTC_DATA_ATTR volatile uint32_t TxDutyCycle_hold;
-RTC_DATA_ATTR volatile uint32_t initialCycleFast = 0;     //  number of time to cycle fast on startup
+RTC_DATA_ATTR volatile uint32_t initialCycleFast;    //  number of times to cycle fast on startup
+#define INITIAL_CYCLE_FAST      10
 RTC_DATA_ATTR volatile uint32_t g_sched_override_ms = 0;  //  pending cycle time changes to apply just before sleep
 RTC_DATA_ATTR uint32_t inv_m_u32 = 50552;                 // b-10 stored as Q16.16 (converted once on downlink), no sleve: 98 selve tranduced: 175
 RTC_DATA_ATTR uint16_t lakeRaw = 0;                       //  for display
@@ -167,7 +186,7 @@ bool overTheAirActivation = true;
 bool loraWanAdr = true;
 
 /* Indicates if the node is sending confirmed or unconfirmed messages */
-bool isTxConfirmed = true;
+bool isTxConfirmed = false;
 
 /* Application port */
 #ifdef REED_NODE
@@ -242,6 +261,7 @@ inline uint16_t depth_m_from_raw(int16_t raw) {
 static inline void schedule_next_cycle(void) {
   if (initialCycleFast > 0) {
     LoRaWAN.cycle(TX_CYCLE_FAST_TIME);
+    Serial.printf("initialCycleFast: %" PRIu32 "\n", initialCycleFast);
     initialCycleFast--;
   } else {
     txDutyCycleTime = appTxDutyCycle + randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND);
@@ -250,100 +270,94 @@ static inline void schedule_next_cycle(void) {
 }
 
 void display_status() {
-  // if (join_inflight) return;  // don’t stall the join path
-  // if ((int32_t)(millis() - g_last_tx_ms) > (int32_t)RX_GUARD_MS) {
-  //   // RX windows have passed; no point waiting
-  // } else {
-  //   TickType_t t0 = xTaskGetTickCount();
-  //   vTaskDelayUntil(&t0, pdMS_TO_TICKS(3000));
-  // }
+
   Serial.println("in display_status fx ");
   // [GPT] init-once in setup; removed display.init() here to avoid heap churn
 
-  display.clear();  // wipe framebuffer before drawing
-  display.setFont(ArialMT_Plain_16);
-  display.setTextAlignment(TEXT_ALIGN_CENTER);
+  myDisplay.clear();  // wipe framebuffer before drawing
+  myDisplay.setFont(ArialMT_Plain_16);
+  myDisplay.setTextAlignment(TEXT_ALIGN_CENTER);
   //common screen entries:  battery, cycle time, rssi, snr, display name
   snprintf(buffer, sizeof(buffer), "battery: %lu %%", RTC_SLOW_MEMORY[ULP_BAT_PCT]);  // bat_cap8() populates this, and is run in prepareDataFrame
-  display.drawString(210, 50, buffer);
+  myDisplay.drawString(210, 50, buffer);
   snprintf(buffer, sizeof(buffer), "cycle %lu min", (uint32_t)appTxDutyCycle / 60000);  //  SHOULD BE 60000 milliseconds to mins
-  display.drawString(210, 70, buffer);
+  myDisplay.drawString(210, 70, buffer);
   snprintf(buffer, sizeof(buffer), "rssi (dBm): %d snr: %d", revrssi, revsnr);
-  display.drawString(210, 90, buffer);
+  myDisplay.drawString(210, 90, buffer);
   snprintf(buffer, sizeof(buffer), "Eui: ...%02x%02x", devEui[6], devEui[7]);  //  last two bytes of devEui
 
-  display.drawString(210, 110, buffer);
-  display.setFont(ArialMT_Plain_24);
-  display.drawString(60, 100, g_name);  //  screen name
+  myDisplay.drawString(210, 110, buffer);
+  myDisplay.setFont(ArialMT_Plain_24);
+  myDisplay.drawString(60, 100, g_name);  //  screen name
 
 
 #ifdef VALVE_NODE
   uint16_t pressure = depth_m_from_raw(readMCP3421avg_cont());
   //Serial.printf("adc result: %u\n", unsigned(readMCP3421avg_cont()));
   //Serial.printf("pressure in valve node: %u\n", unsigned(pressure));
-  display.drawLine(0, 25, 120, 25);
-  display.drawLine(150, 25, 270, 25);
-  display.drawString(60, 0, "valve");
+  myDisplay.drawLine(0, 25, 120, 25);
+  myDisplay.drawLine(150, 25, 270, 25);
+  myDisplay.drawString(60, 0, "valve");
   show_vlv_status(0);
-  display.drawString(60, 40, buffer);
+  myDisplay.drawString(60, 40, buffer);
   show_vlv_status(1);
-  display.drawString(60, 65, buffer);
+  myDisplay.drawString(60, 65, buffer);
   snprintf(buffer, sizeof(buffer), "%.1f psi", float(pressure / 100));
-  display.drawString(210, 0, buffer);
+  myDisplay.drawString(210, 0, buffer);
 #endif
 
 #ifdef REED_NODE
-  display.drawLine(0, 25, 80, 25);
-  display.drawLine(95, 25, 300, 25);
-  display.drawString(80, 0, "interval  total c");
+  myDisplay.drawLine(0, 25, 80, 25);
+  myDisplay.drawLine(95, 25, 300, 25);
+  myDisplay.drawString(80, 0, "interval  total c");
   snprintf(buffer, sizeof(buffer), "%u gal/m", (uint32_t)(RTC_SLOW_MEMORY[ULP_FLOW_RATE]));
-  display.drawString(60, 35, buffer);
+  myDisplay.drawString(60, 35, buffer);
   snprintf(buffer, sizeof(buffer), "%u gal", (uint32_t)(RTC_SLOW_MEMORY[ULP_VOLUME_DELTA]));
-  display.drawString(60, 65, buffer);
+  myDisplay.drawString(60, 65, buffer);
   uint32_t count = read_count32();
   snprintf(buffer, sizeof(buffer), "%lu", count);  // counter
-  display.drawString(220, 0, buffer);
-  display.setFont(ArialMT_Plain_16);
+  myDisplay.drawString(220, 0, buffer);
+  myDisplay.setFont(ArialMT_Plain_16);
   snprintf(buffer, sizeof(buffer), "reed/wake: %lu", RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD]);  // reed closures per wake cycle
-  display.drawString(210, 30, buffer);
+  myDisplay.drawString(210, 30, buffer);
 #endif
 
 #ifdef SOIL_SENSOR_NODE
-  display.setFont(ArialMT_Plain_16);
-  display.drawString(60, 0, "Soil s, d");
+  myDisplay.setFont(ArialMT_Plain_16);
+  myDisplay.drawString(60, 0, "Soil s, d");
   if (soilSensorOut[0] || soilSensorOut[3]) {
     snprintf(buffer, sizeof(buffer), "H20%% %u,  %u", soilSensorOut[0], soilSensorOut[3]);
-    display.drawString(60, 30, buffer);
+    myDisplay.drawString(60, 30, buffer);
   }
   if (soilSensorOut[1] || soilSensorOut[4]) {
     snprintf(buffer, sizeof(buffer), "degC %u, %u", soilSensorOut[1], soilSensorOut[4]);
-    display.drawString(60, 50, buffer);
+    myDisplay.drawString(60, 50, buffer);
   }
   if (soilSensorOut[2] || soilSensorOut[5]) {
     snprintf(buffer, sizeof(buffer), "pH %.1f, %.1f", (float)soilSensorOut[2] / 10, (float)soilSensorOut[5] / 10);  //
-    display.drawString(60, 70, buffer);
+    myDisplay.drawString(60, 70, buffer);
   }
 #endif
 
 #ifdef LAKE_NODE
   // --- Lake depth display (calibrated meters), uplink remains uncalibrated ---
   // RTC carries last pressResult
-  display.setFont(ArialMT_Plain_16);
+  myDisplay.setFont(ArialMT_Plain_16);
   snprintf(buffer, sizeof(buffer), "sensor depth");
-  display.drawString(80, 60, buffer);
+  myDisplay.drawString(80, 60, buffer);
   snprintf(buffer, sizeof(buffer), "%.3f m", static_cast<float>(g_lake_depth_mm) * (1.0f / 1000.0f));
-  display.drawString(80, 80, buffer);
-  display.setFont(ArialMT_Plain_24);
+  myDisplay.drawString(80, 80, buffer);
+  myDisplay.setFont(ArialMT_Plain_24);
   snprintf(buffer, sizeof(buffer), "Depth: %.3f m", static_cast<float>(sensorMeasuredDepth) * (1.0f / 1000.0f));
-  display.drawString(140, 26, buffer);
+  myDisplay.drawString(140, 26, buffer);
   snprintf(buffer, sizeof(buffer), "Level: %.3f m", static_cast<float>(lake_level_mm) * (1.0f / 1000.0f));
-  display.drawString(140, 0, buffer);
+  myDisplay.drawString(140, 0, buffer);
 
 #endif
 
 
-  Serial.print("about to display.display \n");
-  display.display();
+  Serial.print("about to myDisplay.display \n");
+  myDisplay.display();
 
   // for(int i = 0; i < 25; i++){
   // Serial.printf(" [%2d]: 0x%08X\n", i, RTC_SLOW_MEMORY[i]);
@@ -352,7 +366,7 @@ void display_status() {
   // [GPT] wait for E-Ink to finish via BUSY pin (non-blocking yield with timeout)
   bool ok = eink_wait_idle(4000);
   if (!ok) Serial.println("E-ink wait timeout; proceeding cautiously");
-  delay(2000);  //  more time to be sure...
+
 
 }  // of function
 /*
@@ -433,11 +447,10 @@ void pop_data(void) {
 #endif
 
 #ifdef LAKE_NODE
-  delay(100);  //  allow sensor to stabilize
+
   uint16_t lakeResult = readDepthSensor(200, 7);
 
 #endif
-  g_need_display = true;
 }
 
 /* Prepares the payload of the frame and decrements valve counter or turns off if time is up*/
@@ -527,6 +540,12 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
   const uint8_t len = mcpsIndication->BufferSize;
   const uint8_t port = mcpsIndication->Port;
 
+  Serial.printf("[DL] win=%s  port=%u  len=%u  cnt=%lu  rssi=%d  snr=%d\n",
+                rxw(mcpsIndication->RxSlot), mcpsIndication->Port,
+                mcpsIndication->BufferSize,
+                (unsigned long)mcpsIndication->DownLinkCounter,
+                mcpsIndication->Rssi, mcpsIndication->Snr);
+
   Serial.printf("+++++REV DATA:%s,RXSIZE %u,PORT %u\r\n",
                 mcpsIndication->RxSlot ? "RXWIN2" : "RXWIN1", len, port);
   Serial.print("+REV DATA:");
@@ -582,7 +601,7 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
         break;
       }
 
-    case 7:
+    case 7:     //  screen name
       {
         constexpr size_t MAX_NAME = 12;
         if (len == 0 || len > MAX_NAME) {
@@ -679,7 +698,8 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
   }  // switch
   revrssi = mcpsIndication->Rssi;
   revsnr = mcpsIndication->Snr;
-  g_need_display = true;
+  xSemaphoreGive(g_uiSem);  // give as many times as you want; only 1 token held
+
   Serial.println("downlink processed");
 }
 
@@ -885,11 +905,11 @@ void setup() {
 
   static bool displayInited = false;
   if (!displayInited) {
-    display.init();
+    myDisplay.init();
     displayInited = true;
   }
-  display.screenRotate(ANGLE_180_DEGREE);
-  display.setFont(ArialMT_Plain_24);
+  myDisplay.screenRotate(ANGLE_180_DEGREE);
+  myDisplay.setFont(ArialMT_Plain_24);
 
   // RTC GPIO + ULP wake enable
   ESP_ERROR_CHECK(rtc_gpio_hold_dis(RTC_GPIO_SENSOR_PIN));
@@ -909,7 +929,6 @@ void setup() {
       {
         uint32_t count = read_count32();
         Serial.printf("Woke by ULP reed trigger, pulse count = %u\n", count);
-
       }
       break;
 
@@ -917,19 +936,17 @@ void setup() {
       {
         uint32_t count = read_count32();
         Serial.printf("Woke by RTC TIMER, pulse count = %u\n", count);
-
       }
       break;
 
     case ESP_SLEEP_WAKEUP_UNDEFINED:
       {                            // cold boot
         TxDutyCycle_hold = 30000;  // 30 s backup
+        initialCycleFast = INITIAL_CYCLE_FAST;
 
-
-#if !defined(VALVE_NODE)
+#if defined(VALVE_NODE)
         valveState->onA = 0;
         valveState->onB = 0;
-#else
         controlValve(0, 0);
         controlValve(1, 0);
 #endif
@@ -977,13 +994,28 @@ void setup() {
       {
         uint32_t count = read_count32();
         Serial.printf("Woke by DEFAULT, pulse count = %u\n", count);
-
       }
       break;
   }  // switch
 
+  pop_data();
+  display_status();
+  vTaskDelay(pdMS_TO_TICKS(3000));
+
+#ifdef CALIBRATE_DEPTH
+  while (1){
+    pop_data();
+    Serial.printf("lakeDepth32Raw = %u\n", lakeDepth32Raw);
+    delay(3000);
+  }
+  #endif
+
   Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+  g_uiSem = xSemaphoreCreateBinary();  // binary: coalesces multiple gives
+  configASSERT(g_uiSem);
+
   Serial.printf("wake up case completed, LORAWAN_APP_DATA_MAX_SIZE = %u\n", (unsigned)LORAWAN_APP_DATA_MAX_SIZE);
+  //widen_rx_window();          //  open the rx window,
   delay(100);
 
   Serial.println("BOOT: after HELTEC_B start, Serial ready");
@@ -995,6 +1027,11 @@ void setup() {
 }
 
 void loop() {
+  static eDeviceState_LoraWan prevState = (eDeviceState_LoraWan)-1;
+  if (prevState != deviceState) {
+    Serial.printf("STATE -> %d\n", (int)deviceState);
+    prevState = deviceState;
+  }
   switch (deviceState) {
     case DEVICE_STATE_INIT:
       {
@@ -1018,25 +1055,27 @@ void loop() {
         // STOCK: build payload, send, then advance to CYCLE
         prepareTxFrame(appPort);
         LoRaWAN.send();
+        g_last_tx_ms = millis();
         deviceState = DEVICE_STATE_CYCLE;
         break;
       }
     case DEVICE_STATE_CYCLE:
       {
         //Serial.println("In CYCLE");
-        schedule_next_cycle();      //  allows for fast initial cycles to figure our ADR and make settings
+        //schedule_next_cycle();  //  allows for fast initial cycles to figure our ADR and make settings
+        schedule_next_cycle();
         deviceState = DEVICE_STATE_SLEEP;
+        //vTaskDelay(pdMS_TO_TICKS(3000));
         break;
       }
     case DEVICE_STATE_SLEEP:
       {
-        //Serial.println("In SLEEP");
-        if (!join_inflight && g_need_display) {
-          display_status();  // blocking is fine now
-          g_need_display = false;
+        // Only draw if a token is available AND RX1/RX2 guard has elapsed
+        if (xSemaphoreTake(g_uiSem, 0) == pdTRUE && rx_windows_clear()) {
+          display_status();  // one-shot; no loops here
         }
-        LoRaWAN.sleep(loraWanClass);
-        break;
+        LoRaWAN.sleep(loraWanClass);  // hand control to the MAC/platform
+        return;                       // IMPORTANT: no vTaskDelay(), no extra code after sleep
       }
     default:
       {
